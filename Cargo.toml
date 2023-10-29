@@ -27,3 +27,7 @@ clap = { version = "4.4.7", features = ["derive"] }
 tokenizers = { version = "0.14.1", features = ["hf-hub", "http"] }
 ordered-float = "4.1.1"
 norman = "0.0.4"
+axum = { version = "0.6.20", features = ["macros"] }
+tokio = { version = "1.33.0", features = ["full"] }
+url = { version = "2.4.1", features = ["serde"] }
+serde-hex = "0.1.0"

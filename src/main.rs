@@ -1,8 +1,11 @@
+use axum::http::StatusCode;
 use color_eyre::{eyre::eyre, Result};
 use image::imageops::FilterType;
 use indicatif::{ParallelProgressIterator, ProgressStyle};
 use jwalk::WalkDir;
+use serde_hex::{SerHex, Compact, Strict};
 
+use ndarray::Data;
 use norman::special::NormEucl;
 use ordered_float::NotNan;
 use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -120,7 +123,9 @@ fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P) -> Result<()> {
     for entry in WalkDir::new(root) {
         let path = entry?.path();
         let loc = match path.extension().and_then(|s| s.to_str()) {
-            Some("jpg") | Some("jpeg") | Some("png") => ObjectLocation::LocalPath(path),
+            Some("jpg") | Some("jpeg") | Some("png") => {
+                ObjectLocation::LocalPath(std::fs::canonicalize(path)?)
+            }
             _ => continue,
         };
         scanned.push(loc);
@@ -130,6 +135,7 @@ fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P) -> Result<()> {
         scanned.into_iter().filter(|i| !db.has(i)).collect()
     };
     eprintln!("Found {} new items.", scanned.len());
+    eprintln!("Hashing...");
 
     scanned
         .into_par_iter()
@@ -217,7 +223,7 @@ fn main() -> color_eyre::Result<()> {
             Args::command().print_help()?;
         }
         Some(Commands::Serve) => {
-            //serve_search(get_db()?, &config)?;
+            serve_search(get_db()?, &config)?;
         }
         Some(Commands::UpdateDb) => {
             update_db(get_db()?, &config)?;
@@ -230,18 +236,37 @@ fn main() -> color_eyre::Result<()> {
 }
 
 struct TextEmbedder {
-    session: ort::Session,
+    _ortenv: Arc<ort::Environment>,
+    session: Option<ort::Session>,
     tokenizer: tokenizers::Tokenizer,
     input_ids: Vec<i64>,
 }
 impl TextEmbedder {
-    fn new(config: &Config, ortenv: Arc<ort::Environment>) -> Result<Self> {
-        let session = ort::SessionBuilder::new(&ortenv)?
-            .with_optimization_level(ort::GraphOptimizationLevel::Level1)?
-            .with_model_from_file("text.onnx")?;
+    fn new(config: &Config) -> Result<Self> {
+        let gpu_id = config.gpu_id.unwrap_or(0);
+
+        let ortenv = ort::Environment::builder()
+            .with_name("clip-text")
+            .with_execution_providers([
+                ort::ExecutionProvider::CUDA(
+                    ort::execution_providers::CUDAExecutionProviderOptions {
+                        device_id: gpu_id,
+                        ..Default::default()
+                    },
+                ),
+                ort::ExecutionProvider::CPU(Default::default()),
+            ])
+            .build()?
+            .into_arc();
+        let session = Some(
+            ort::SessionBuilder::new(&ortenv)?
+                .with_optimization_level(ort::GraphOptimizationLevel::Level1)?
+                .with_model_from_file("text.onnx")?,
+        );
         let tokenizer = tokenizers::Tokenizer::from_pretrained("timm/ViT-L-16-SigLIP-384", None)
             .map_err(|e| eyre!("{e:?}"))?;
         Ok(TextEmbedder {
+            _ortenv: ortenv,
             session,
             tokenizer,
             input_ids: vec![0; 64],
@@ -265,10 +290,8 @@ impl TextEmbedder {
         let ids = ndarray::CowArray::from(&self.input_ids)
             .into_shape((1, 64))?
             .into_dyn();
-        let result = self.session.run(vec![ort::Value::from_array(
-            self.session.allocator(),
-            &ids,
-        )?])?;
+        let session = self.session.as_mut().unwrap();
+        let result = session.run(vec![ort::Value::from_array(session.allocator(), &ids)?])?;
         let emb: ort::tensor::OrtOwnedTensor<f32, _> = result[0].try_extract()?;
         drop(result);
         let embv: Vec<f32> = emb.view().iter().copied().collect();
@@ -276,23 +299,15 @@ impl TextEmbedder {
         Ok(embv)
     }
 }
+impl Drop for TextEmbedder {
+    fn drop(&mut self) {
+        // `ort` bug - currently need to make sure the session cannot outlive the environment ourselves
+        self.session.take();
+    }
+}
 
 fn search_db(db: Arc<Mutex<Database>>, config: &Config, query: String) -> Result<()> {
-    let gpu_id = config.gpu_id.unwrap_or(0);
-
-    let ortenv = ort::Environment::builder()
-        .with_name("clip-text")
-        .with_execution_providers([
-            ort::ExecutionProvider::CUDA(ort::execution_providers::CUDAExecutionProviderOptions {
-                device_id: gpu_id,
-                ..Default::default()
-            }),
-            ort::ExecutionProvider::CPU(Default::default()),
-        ])
-        .build()?
-        .into_arc();
-
-    let mut te = TextEmbedder::new(config, ortenv.clone())?;
+    let mut te = TextEmbedder::new(config)?;
 
     {
         let embv = te.embed_and_norm(&query)?;
@@ -317,37 +332,97 @@ fn search_db(db: Arc<Mutex<Database>>, config: &Config, query: String) -> Result
             eprintln!("{dist} {obj:?}")
         }
     }
-    drop(te);
     Ok(())
 }
 
-// struct AppState {
-//     te: Arc<Mutex<TextEmbedder>>,
-// }
+struct AppState {
+    te: Arc<Mutex<TextEmbedder>>,
+    db: Arc<Mutex<Database>>,
+}
 
-// async fn handle_search(axum::extract::State(state): axum::extract::State<Arc<AppState>>) {}
-// async fn serve(app: Router, port: u16) {
-//     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-//     axum::Server::bind(&addr)
-//         .serve(app.into_make_service())
-//         .await
-//         .unwrap();
-// }
-// fn serve_search(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
-//     let rt = tokio::runtime::Runtime::new()?;
-//     let state = Arc::new(AppState {
-//         te: Arc::new(Mutex::new(TextEmbedder::new(config)?)),
-//     });
-//     let app = axum::Router::new()
-//         .route("/search_text", axum::routing::get(handle_search))
-//         .with_state(state);
+#[derive(Deserialize)]
+struct SearchParams {
+    query: String,
+    limit: Option<usize>,
+}
 
-//     rt.block_on(
-//         tokio::spawn(async move {
-//             serve(app, 6680).await;
-//         }))?;
-//     Ok(())
-// }
+#[derive(Serialize, Deserialize)]
+struct NNSearchResult {
+    distance: f32,
+    #[serde(with = "SerHex::<Strict>")]
+    object_id:[u8;32],
+    path: url::Url,
+}
+
+async fn handle_search(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    params: axum::extract::Query<SearchParams>,
+) -> Result<axum::Json<Vec<NNSearchResult>>, StatusCode> {
+    let te = state.te.clone();
+    let db = state.db.clone();
+    let res = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut te = te.lock().unwrap();
+        let embv = te.embed_and_norm(&params.query)?;
+        let embv = normalize(&embv);
+
+        let db = db.lock().unwrap();
+        let eid_to_oid: HashMap<_, _> = db
+            .by_id
+            .iter()
+            .filter_map(|(k, v)| Some((v.embedding_id?, k)))
+            .collect();
+        let mut scores = Vec::new();
+        for (dbi, dbv) in db.clip_embeddings.iter().enumerate() {
+            let ndbv = normalize(dbv);
+            let dist = ip_dist(&embv, &ndbv);
+            scores.push((dist, dbi));
+        }
+        scores.sort_by_key(|(d, _)| NotNan::new(*d).unwrap());
+        let rv = scores
+            .iter()
+            .take(params.limit.unwrap_or(5))
+            .map(|(distance, eid)| {
+                let object_id = **eid_to_oid.get(eid).ok_or(eyre!("eid/oid"))?;
+                let object = db
+                    .by_id
+                    .get(&object_id)
+                    .ok_or(eyre!("oid mismatch"))?
+                    .clone();
+                let ObjectLocation::LocalPath(p) = object.locations[0].clone();
+                Ok(NNSearchResult {
+                    distance: *distance,
+                    object_id: object_id.data,
+                    path: url::Url::from_file_path(p).unwrap(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rv)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(axum::Json(res))
+}
+async fn serve(app: axum::Router, port: u16) -> Result<()> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await?;
+    Ok(())
+}
+fn serve_search(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let state = Arc::new(AppState {
+        te: Arc::new(Mutex::new(TextEmbedder::new(config)?)),
+        db,
+    });
+    let app = axum::Router::new()
+        .route("/search_text", axum::routing::get(handle_search))
+        .with_state(state);
+
+    rt.block_on(async move { serve(app, 6680).await })?;
+    Ok(())
+}
 
 fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
     eprintln!("Db has {} items.", db.lock().unwrap().by_id.len());

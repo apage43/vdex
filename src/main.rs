@@ -3,15 +3,16 @@ use color_eyre::{eyre::eyre, Result};
 use image::imageops::FilterType;
 use indicatif::{ParallelProgressIterator, ProgressStyle};
 use jwalk::WalkDir;
-use serde_hex::{SerHex, Compact, Strict};
+use serde_hex::{Compact, SerHex, Strict};
 
-use ndarray::Data;
+use ndarray::{Data, CowArray};
 use norman::special::NormEucl;
 use ordered_float::NotNan;
 use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use sha2::Digest;
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
@@ -21,6 +22,51 @@ use tokenizers::PaddingParams;
 
 use serde_derive::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CLIPModelInfo {
+    image_dim: (u32, u32),
+    image_mean: (f32, f32, f32),
+    image_std: (f32, f32, f32),
+    text_tokenizer_hub_name: Cow<'static, str>,
+    text_tokenizer_pad_id: u32,
+    text_input_size: usize,
+    arch_name: Cow<'static, str>,
+    pretrain_name: Cow<'static, str>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+enum PretrainedCLIP {
+    VitL16SiglipWebli,
+    VitL14Datacomp,
+}
+
+impl PretrainedCLIP {
+    fn model_info(&self) -> CLIPModelInfo {
+        match self {
+            PretrainedCLIP::VitL16SiglipWebli => CLIPModelInfo {
+                image_dim: (384, 384),
+                image_mean: (0.5, 0.5, 0.5),
+                image_std: (0.5, 0.5, 0.5),
+                text_tokenizer_hub_name: "timm/ViT-L-16-SigLIP-384".into(),
+                text_tokenizer_pad_id: 1,
+                text_input_size: 64,
+                arch_name: "ViT-L-16-SigLIP-384".into(),
+                pretrain_name: "webli".into(),
+            },
+            PretrainedCLIP::VitL14Datacomp => CLIPModelInfo {
+                image_dim: (224, 224),
+                image_mean: (0.48145466, 0.4578275, 0.40821073),
+                image_std: (0.26862954, 0.261_302_6, 0.275_777_1),
+                text_tokenizer_hub_name: "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K".into(),
+                text_tokenizer_pad_id: 0,
+                text_input_size: 77,
+                arch_name: "ViT-L-14".into(),
+                pretrain_name: "datacomp_xl_s13b_b90k".into(),
+            },
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct Collection {
     roots: Vec<PathBuf>,
@@ -28,6 +74,7 @@ struct Collection {
 
 #[derive(Deserialize, Debug)]
 struct Config {
+    clip_model: PretrainedCLIP,
     collections: HashMap<String, Collection>,
     gpu_id: Option<u32>,
 }
@@ -158,17 +205,23 @@ fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P) -> Result<()> {
 
 type DynF32Array = ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::IxDyn>;
 
-fn preprocess_image<P: AsRef<Path>>(path: P) -> Result<DynF32Array> {
+fn preprocess_image<P: AsRef<Path>>(path: P, config: &Config) -> Result<DynF32Array> {
+    let minfo = config.clip_model.model_info();
     let img = image::io::Reader::open(&path)?
         .with_guessed_format()?
         .decode()?;
-    let img = img.resize_exact(384, 384, FilterType::Gaussian);
+    let img = img.resize_exact(minfo.image_dim.0, minfo.image_dim.1, FilterType::Gaussian);
     let ibuf = img.to_rgb32f();
     let fs = ibuf.as_flat_samples();
-    let ndimg = ndarray::CowArray::from(ndarray::ArrayView::from_shape((384, 384, 3), fs.samples)?);
+    let ndimg = ndarray::ArrayView::from_shape(
+        (minfo.image_dim.0 as usize, minfo.image_dim.1 as usize, 3),
+        fs.samples,
+    )?;
     let ndimg = ndimg.permuted_axes([2, 1, 0]);
-    let ndimg = ndimg.map(|v| (v - 0.5) / 0.5);
-    //eprintln!("pp: {} => {ndimg:?}", path.as_ref().display());
+    let nmean = ndarray::array![minfo.image_mean.0, minfo.image_mean.1, minfo.image_mean.2].into_shape((3,1,1))?;
+    let nstd = ndarray::array![minfo.image_std.0, minfo.image_std.1, minfo.image_std.2].into_shape((3,1,1))?;
+    let ndimg = ndimg.to_owned() - nmean;
+    let ndimg = ndimg / nstd;
     Ok(ndimg.into_dyn().into_owned())
 }
 
@@ -240,11 +293,14 @@ struct TextEmbedder {
     session: Option<ort::Session>,
     tokenizer: tokenizers::Tokenizer,
     input_ids: Vec<i64>,
+    modelinfo: CLIPModelInfo,
 }
 impl TextEmbedder {
     fn new(config: &Config) -> Result<Self> {
         let gpu_id = config.gpu_id.unwrap_or(0);
-
+        let modelinfo = config.clip_model.model_info();
+        let tpath = PathBuf::from("clip_models").join(format!("{}_{}_text.onnx", modelinfo.arch_name, modelinfo.pretrain_name));
+    
         let ortenv = ort::Environment::builder()
             .with_name("clip-text")
             .with_execution_providers([
@@ -261,23 +317,24 @@ impl TextEmbedder {
         let session = Some(
             ort::SessionBuilder::new(&ortenv)?
                 .with_optimization_level(ort::GraphOptimizationLevel::Level1)?
-                .with_model_from_file("text.onnx")?,
+                .with_model_from_file(tpath)?,
         );
-        let tokenizer = tokenizers::Tokenizer::from_pretrained("timm/ViT-L-16-SigLIP-384", None)
+        let tokenizer = tokenizers::Tokenizer::from_pretrained(modelinfo.text_tokenizer_hub_name.clone(), None)
             .map_err(|e| eyre!("{e:?}"))?;
         Ok(TextEmbedder {
             _ortenv: ortenv,
             session,
             tokenizer,
-            input_ids: vec![0; 64],
+            input_ids: vec![0; modelinfo.text_input_size],
+            modelinfo,
         })
     }
     fn embed_and_norm(&mut self, inp: &str) -> Result<Vec<f32>> {
         let encd = self
             .tokenizer
             .with_padding(Some(PaddingParams {
-                strategy: tokenizers::PaddingStrategy::Fixed(64),
-                pad_id: 1,
+                strategy: tokenizers::PaddingStrategy::Fixed(self.modelinfo.text_input_size),
+                pad_id: self.modelinfo.text_tokenizer_pad_id,
                 ..Default::default()
             }))
             .encode(inp, false)
@@ -288,12 +345,11 @@ impl TextEmbedder {
             .extend(encd.get_ids().iter().map(|v| *v as i64));
         //eprintln!("ids: {ids:?}");
         let ids = ndarray::CowArray::from(&self.input_ids)
-            .into_shape((1, 64))?
+            .into_shape((1, self.modelinfo.text_input_size))?
             .into_dyn();
         let session = self.session.as_mut().unwrap();
         let result = session.run(vec![ort::Value::from_array(session.allocator(), &ids)?])?;
         let emb: ort::tensor::OrtOwnedTensor<f32, _> = result[0].try_extract()?;
-        drop(result);
         let embv: Vec<f32> = emb.view().iter().copied().collect();
         let embv = normalize(&embv);
         Ok(embv)
@@ -344,22 +400,31 @@ struct AppState {
 struct SearchParams {
     query: String,
     limit: Option<usize>,
+    skip: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct NNSearchResult {
     distance: f32,
     #[serde(with = "SerHex::<Strict>")]
-    object_id:[u8;32],
+    object_id: [u8; 32],
     path: url::Url,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NNSearchResponse {
+    items: Vec<NNSearchResult>,
+    more: bool,
 }
 
 async fn handle_search(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     params: axum::extract::Query<SearchParams>,
-) -> Result<axum::Json<Vec<NNSearchResult>>, StatusCode> {
+) -> Result<axum::Json<NNSearchResponse>, StatusCode> {
     let te = state.te.clone();
     let db = state.db.clone();
+    let skip = params.skip.unwrap_or(0);
+    let limit = params.limit.unwrap_or(5);
     let res = tokio::task::spawn_blocking(move || -> Result<_> {
         let mut te = te.lock().unwrap();
         let embv = te.embed_and_norm(&params.query)?;
@@ -380,7 +445,8 @@ async fn handle_search(
         scores.sort_by_key(|(d, _)| NotNan::new(*d).unwrap());
         let rv = scores
             .iter()
-            .take(params.limit.unwrap_or(5))
+            .skip(skip)
+            .take(limit)
             .map(|(distance, eid)| {
                 let object_id = **eid_to_oid.get(eid).ok_or(eyre!("eid/oid"))?;
                 let object = db
@@ -401,7 +467,7 @@ async fn handle_search(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(axum::Json(res))
+    Ok(axum::Json(NNSearchResponse { items: res, more: skip+limit < state.db.lock().unwrap().by_id.len() }))
 }
 async fn serve(app: axum::Router, port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -433,6 +499,8 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
         }
     }
     let gpu_id = config.gpu_id.unwrap_or(0);
+    let minfo = config.clip_model.model_info();
+    let vpath = PathBuf::from("clip_models").join(format!("{}_{}_visual.onnx", minfo.arch_name, minfo.pretrain_name));
     let ortenv = ort::Environment::builder()
         .with_name("clip")
         .with_execution_providers([
@@ -455,7 +523,7 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
         .into_arc();
     let mut clip_visual_session = ort::SessionBuilder::new(&ortenv)?
         .with_optimization_level(ort::GraphOptimizationLevel::Level3)?
-        .with_model_from_file("visual.onnx")?;
+        .with_model_from_file(vpath)?;
 
     {
         eprintln!("Embedding...");
@@ -475,61 +543,61 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
             })
             .collect();
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        let preproc_thread = std::thread::spawn(move || {
-            path_and_ids
-                .par_iter()
-                .progress_with_style(
-                    ProgressStyle::default_bar()
-                        .template("{wide_bar} {per_sec} {eta} {elapsed}")
-                        .unwrap(),
-                )
-                .for_each(|(id, path)| {
-                    let r = preprocess_image(path);
-                    match r {
-                        Ok(embedding) => {
-                            tx.send(Ok((id.to_owned(), embedding))).unwrap();
+        std::thread::scope(|s| -> Result<()> {
+            s.spawn(move || {
+                path_and_ids
+                    .par_iter()
+                    .progress_with_style(
+                        ProgressStyle::default_bar()
+                            .template("{wide_bar} {per_sec} {eta} {elapsed}")
+                            .unwrap(),
+                    )
+                    .for_each(|(id, path)| {
+                        let r = preprocess_image(path, config);
+                        match r {
+                            Ok(embedding) => {
+                                tx.send(Ok((id.to_owned(), embedding))).unwrap();
+                            }
+                            Err(e) => {
+                                tx.send(Err(e)).unwrap();
+                            }
                         }
-                        Err(e) => {
-                            tx.send(Err(e)).unwrap();
+                    });
+            });
+            let bs = 48;
+            let mut done = false;
+            while !done {
+                let mut imgbatch = vec![];
+                let mut ids = vec![];
+                loop {
+                    match rx.recv() {
+                        Ok(msg) => {
+                            let (oid, preprocd) = msg?;
+                            ids.push(oid);
+                            imgbatch.push(preprocd);
+                        }
+                        Err(_e) => {
+                            done = true;
+                            break;
                         }
                     }
-                });
-        });
-        let bs = 32;
-        let mut done = false;
-        while !done {
-            let mut imgbatch = vec![];
-            let mut ids = vec![];
-            loop {
-                match rx.recv() {
-                    Ok(msg) => {
-                        let (oid, preprocd) = msg?;
-                        ids.push(oid);
-                        imgbatch.push(preprocd);
-                    }
-                    Err(_e) => {
-                        done = true;
+                    if imgbatch.len() >= bs {
                         break;
                     }
                 }
-                if imgbatch.len() >= bs {
-                    break;
+                if !imgbatch.is_empty() {
+                    let mut embeddings = embed_images(&mut clip_visual_session, imgbatch)?;
+                    let mut db = db.lock().unwrap();
+                    let sidx = db.clip_embeddings.len();
+                    db.clip_embeddings.append(&mut embeddings);
+                    for (oid, eid) in ids.iter().zip(sidx..) {
+                        db.by_id.get_mut(oid).unwrap().embedding_id = Some(eid);
+                    }
                 }
             }
-            if !imgbatch.is_empty() {
-                let mut embeddings = embed_images(&mut clip_visual_session, imgbatch)?;
-                //println!("eshape b: {} i {}", embeddings.len(), embeddings[0].len());
-                //let mut embeddings = embeddings.iter().map(normalize).collect();
-                //eprintln!("emb: {:?}", embeddings);
-                let mut db = db.lock().unwrap();
-                let sidx = db.clip_embeddings.len();
-                db.clip_embeddings.append(&mut embeddings);
-                for (oid, eid) in ids.iter().zip(sidx..) {
-                    db.by_id.get_mut(oid).unwrap().embedding_id = Some(eid);
-                }
-            }
-        }
-        preproc_thread.join().map_err(|e| eyre!("{e:?}"))?;
+            //preproc_thread.join().map_err(|e| eyre!("{e:?}"))?;
+            Ok(())
+        })?;
         db.lock().unwrap().persist()?;
     }
 

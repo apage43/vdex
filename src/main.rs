@@ -456,11 +456,11 @@ async fn handle_search(
             let scores: Vec<(f32, usize)> = tokio::task::spawn_blocking(move || -> Result<_> {
                 let embv = if query.starts_with("similar:") {
                     let (_, oid) = query.trim().split_once(':').ok_or_else(|| eyre!("split"))?;
-                    if oid.is_empty() {
-                        bail!("empty oid");
+                    if oid.len() < 64 {
+                        bail!("bad oid");
                     }
+                    let oid: [u8; 32] = SerHex::<serde_hex::Strict>::from_hex(oid)?;
                     let db = db.lock().unwrap();
-                    let oid: [u8; 32] = SerHex::<Strict>::from_hex(oid)?;
                     let oid = ObjectId { data: oid };
                     if let Some(obj) = db.by_id.get(&oid) {
                         if let Some(eid) = obj.embedding_id {
@@ -496,7 +496,7 @@ async fn handle_search(
             })
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
 
             state
                 .query_cache

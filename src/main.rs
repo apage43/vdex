@@ -238,6 +238,8 @@ enum Commands {
     UpdateDb {
         #[arg(short, long)]
         media_dirs: Vec<PathBuf>,
+        #[arg(short, long, default_value="8")]
+        batch_size: usize,
     },
     Serve,
     Search {
@@ -269,8 +271,8 @@ fn main() -> color_eyre::Result<()> {
         Some(Commands::Serve) => {
             serve_search(get_db()?, &config)?;
         }
-        Some(Commands::UpdateDb { media_dirs }) => {
-            update_db(get_db()?, &config, &media_dirs)?;
+        Some(Commands::UpdateDb { media_dirs, batch_size }) => {
+            update_db(get_db()?, &config, &media_dirs, batch_size)?;
         }
         Some(Commands::Search { query }) => {
             search_db(get_db()?, &config, query)?;
@@ -564,7 +566,7 @@ fn serve_search(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn update_db(db: Arc<Mutex<Database>>, config: &Config, scan_paths: &[PathBuf]) -> Result<()> {
+fn update_db(db: Arc<Mutex<Database>>, config: &Config, scan_paths: &[PathBuf], batch_size: usize) -> Result<()> {
     eprintln!("Db has {} items.", db.lock().unwrap().by_id.len());
     eprintln!("Scanning...");
     for root in scan_paths.iter() {
@@ -645,7 +647,7 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config, scan_paths: &[PathBuf]) 
                         }
                     });
             });
-            let bs = 48;
+            let bs = batch_size;
             let mut done = false;
             while !done {
                 let mut imgbatch = vec![];

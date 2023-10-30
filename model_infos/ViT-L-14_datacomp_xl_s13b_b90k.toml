@@ -1,0 +1,10 @@
+image_dim = [224, 224]
+image_mean = [0.48145467042922974, 0.45782750844955444, 0.40821072459220886]
+image_std = [0.2686295509338379, 0.2613025903701782, 0.27577710151672363]
+text_tokenizer_hub_name = "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K"
+text_tokenizer_bos = "<|startoftext|>"
+text_tokenizer_pad = "!"
+text_tokenizer_eos = "<|endoftext|>"
+text_input_size = 77
+arch_name = "ViT-L-14"
+pretrain_name = "datacomp_xl_s13b_b90k"

@@ -38,56 +38,6 @@ struct CLIPModelInfo {
     pretrain_name: Cow<'static, str>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-enum PretrainedCLIP {
-    VitL16SiglipWebli,
-    VitL14Datacomp,
-}
-
-impl PretrainedCLIP {
-    fn model_info(&self) -> CLIPModelInfo {
-        match self {
-            PretrainedCLIP::VitL16SiglipWebli => CLIPModelInfo {
-                image_dim: (384, 384),
-                image_mean: (0.5, 0.5, 0.5),
-                image_std: (0.5, 0.5, 0.5),
-                text_tokenizer_hub_name: "timm/ViT-L-16-SigLIP-384".into(),
-                text_tokenizer_pad: "</s>".into(),
-                text_tokenizer_eos: "</s>".into(),
-                text_input_size: 64,
-                arch_name: "ViT-L-16-SigLIP-384".into(),
-                pretrain_name: "webli".into(),
-                text_tokenizer_bos: None,
-            },
-            PretrainedCLIP::VitL14Datacomp => CLIPModelInfo {
-                image_dim: (224, 224),
-                image_mean: (0.48145466, 0.4578275, 0.40821073),
-                image_std: (0.26862954, 0.261_302_6, 0.275_777_1),
-                text_tokenizer_hub_name: "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K".into(),
-                text_tokenizer_eos: "<|endoftext|>".into(),
-                text_input_size: 77,
-                arch_name: "ViT-L-14".into(),
-                pretrain_name: "datacomp_xl_s13b_b90k".into(),
-                text_tokenizer_bos: Some("<|startoftext|>".into()),
-                text_tokenizer_pad: "!".into(),
-            },
-        }
-    }
-}
-
-#[derive(Deserialize, Debug)]
-struct Collection {
-    roots: Vec<PathBuf>,
-}
-
-#[derive(Deserialize, Debug)]
-struct Config {
-    clip_model: PretrainedCLIP,
-    collections: HashMap<String, Collection>,
-    db_path: PathBuf,
-    gpu_id: Option<u32>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum ObjectLocation {
     LocalPath(PathBuf),
@@ -224,7 +174,7 @@ fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P, config: &Config) -> R
 type DynF32Array = ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::IxDyn>;
 
 fn preprocess_image(img: image::DynamicImage, config: &Config) -> Result<DynF32Array> {
-    let minfo = config.clip_model.model_info();
+    let minfo = &config.model_info;
     let img = img.resize_exact(minfo.image_dim.0, minfo.image_dim.1, FilterType::Gaussian);
     let ibuf = img.to_rgb32f();
     let fs = ibuf.as_flat_samples();
@@ -239,41 +189,6 @@ fn preprocess_image(img: image::DynamicImage, config: &Config) -> Result<DynF32A
     let ndimg = ndimg.permuted_axes([2, 1, 0]);
 
     Ok(ndimg.into_dyn().into_owned())
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::preprocess_image;
-
-    #[test]
-    fn prep_test_rgbnorm() {
-        let blimg = image::Rgb32FImage::new(224, 224);
-        let prepped = preprocess_image(
-            blimg.into(),
-            &crate::Config {
-                clip_model: crate::PretrainedCLIP::VitL14Datacomp,
-                collections: Default::default(),
-                db_path: Default::default(),
-                gpu_id: None,
-            },
-        );
-        eprintln!("prepped black: {:?}", prepped);
-    }
-
-    #[test]
-    fn prep_test_mononorm() {
-        let blimg = image::Rgb32FImage::new(384, 384);
-        let prepped = preprocess_image(
-            blimg.into(),
-            &crate::Config {
-                clip_model: crate::PretrainedCLIP::VitL16SiglipWebli,
-                collections: Default::default(),
-                db_path: Default::default(),
-                gpu_id: None,
-            },
-        );
-        eprintln!("prepped black: {:?}", prepped);
-    }
 }
 
 fn embed_images(
@@ -296,27 +211,49 @@ fn embed_images(
 
 use clap::{CommandFactory, Parser, Subcommand};
 
+#[derive(Deserialize, Debug)]
+struct Config {
+    model_info: CLIPModelInfo,
+    db_path: PathBuf,
+    gpu_id: u32,
+}
+
 #[derive(Parser)]
 struct Args {
-    #[arg(short, long, value_name = "FILE")]
-    config: Option<PathBuf>,
+    #[arg(
+        short,
+        long,
+        default_value = "./model_infos/ViT-L-16-SigLIP_webli.toml"
+    )]
+    model_config: PathBuf,
+    #[arg(short, long, default_value = "./db")]
+    db_path: PathBuf,
+    #[arg(short, long, default_value = "1")]
+    gpu_id: u32,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 #[derive(Subcommand)]
 enum Commands {
-    UpdateDb,
+    UpdateDb {
+        #[arg(short, long)]
+        media_dirs: Vec<PathBuf>,
+    },
     Serve,
-    Search { query: String },
+    Search {
+        query: String,
+    },
 }
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-
-    let config_raw =
-        std::fs::read_to_string(args.config.unwrap_or_else(|| PathBuf::from("config.toml")))?;
-    let config: Config = toml::from_str(&config_raw)?;
+    let model_info: CLIPModelInfo = toml::from_str(&std::fs::read_to_string(args.model_config)?)?;
+    let config: Config = Config {
+        db_path: args.db_path,
+        gpu_id: args.gpu_id,
+        model_info,
+    };
     let get_db = || {
         let db: Database = match std::fs::read(config.db_path.join("db.bc")) {
             Ok(fbsrc) => bincode::deserialize(&fbsrc)?,
@@ -332,8 +269,8 @@ fn main() -> color_eyre::Result<()> {
         Some(Commands::Serve) => {
             serve_search(get_db()?, &config)?;
         }
-        Some(Commands::UpdateDb) => {
-            update_db(get_db()?, &config)?;
+        Some(Commands::UpdateDb { media_dirs }) => {
+            update_db(get_db()?, &config, &media_dirs)?;
         }
         Some(Commands::Search { query }) => {
             search_db(get_db()?, &config, query)?;
@@ -351,8 +288,8 @@ struct TextEmbedder {
 }
 impl TextEmbedder {
     fn new(config: &Config) -> Result<Self> {
-        let gpu_id = config.gpu_id.unwrap_or(0);
-        let modelinfo = config.clip_model.model_info();
+        let gpu_id = config.gpu_id;
+        let modelinfo = &config.model_info;
         let tpath = PathBuf::from("clip_models").join(format!(
             "{}_{}_text.onnx",
             modelinfo.arch_name, modelinfo.pretrain_name
@@ -384,7 +321,7 @@ impl TextEmbedder {
             session,
             tokenizer,
             input_ids: vec![0; modelinfo.text_input_size],
-            modelinfo,
+            modelinfo: modelinfo.clone(),
         })
     }
     fn embed_text(&mut self, inp: &str) -> Result<Vec<f32>> {
@@ -627,16 +564,14 @@ fn serve_search(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
+fn update_db(db: Arc<Mutex<Database>>, config: &Config, scan_paths: &[PathBuf]) -> Result<()> {
     eprintln!("Db has {} items.", db.lock().unwrap().by_id.len());
     eprintln!("Scanning...");
-    for (_cname, coll) in config.collections.iter() {
-        for root in coll.roots.iter() {
-            scan(db.clone(), root, config)?;
-        }
+    for root in scan_paths.iter() {
+        scan(db.clone(), root, config)?;
     }
-    let gpu_id = config.gpu_id.unwrap_or(0);
-    let minfo = config.clip_model.model_info();
+    let gpu_id = config.gpu_id;
+    let minfo = &config.model_info;
     let vpath = PathBuf::from("clip_models").join(format!(
         "{}_{}_visual.onnx",
         minfo.arch_name, minfo.pretrain_name

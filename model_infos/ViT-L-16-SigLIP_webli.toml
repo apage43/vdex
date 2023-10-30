@@ -1,0 +1,9 @@
+image_dim = [384, 384]
+image_mean = [0.5, 0.5, 0.5]
+image_std = [0.5, 0.5, 0.5]
+text_tokenizer_hub_name = "timm/ViT-L-16-SigLIP-384"
+text_tokenizer_pad = "</s>"
+text_tokenizer_eos = "</s>"
+text_input_size = 64
+arch_name = "ViT-L-16-SigLIP-384"
+pretrain_name = "webli"

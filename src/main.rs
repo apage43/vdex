@@ -1,24 +1,26 @@
 use axum::http::StatusCode;
-use color_eyre::{eyre::eyre, Result};
+use color_eyre::{
+    eyre::{bail, eyre},
+    Result,
+};
 use image::imageops::FilterType;
 use indicatif::{ParallelProgressIterator, ProgressStyle};
 use jwalk::WalkDir;
 use serde_hex::{SerHex, Strict};
 
-use norman::special::NormEucl;
 use ordered_float::NotNan;
 use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use sha2::Digest;
 use std::{
     borrow::Cow,
+    cmp::Reverse,
     collections::HashMap,
     io::Write,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tokenizers::PaddingParams;
 
 use serde_derive::{Deserialize, Serialize};
 
@@ -66,8 +68,8 @@ impl PretrainedCLIP {
                 text_input_size: 77,
                 arch_name: "ViT-L-14".into(),
                 pretrain_name: "datacomp_xl_s13b_b90k".into(),
-                text_tokenizer_bos: Some( "<|startoftext|>".into()),
-                text_tokenizer_pad: todo!(),
+                text_tokenizer_bos: Some("<|startoftext|>".into()),
+                text_tokenizer_pad: "!".into(),
             },
         }
     }
@@ -145,12 +147,16 @@ fn l2dist(a: &[f32], b: &[f32]) -> f32 {
         .sum::<f32>()
         .sqrt()
 }
-fn ip_dist(a: &[f32], b: &[f32]) -> f32 {
-    1.0 - a.iter().zip(b.iter()).map(|(av, bv)| av * bv).sum::<f32>()
+
+fn cos_sim(a: &[f32], b: &[f32]) -> f32 {
+    let ip = a.iter().zip(b.iter()).map(|(a, b)| a * b).sum::<f32>();
+    let mag_a = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let mag_b = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+    ip / (mag_a * mag_b)
 }
 
 fn normalize(inp: &Vec<f32>) -> Vec<f32> {
-    let norm = inp.norm_eucl();
+    let norm = inp.iter().map(|v| v.abs().powf(2.0)).sum::<f32>() / (inp.len() as f32);
     inp.iter().map(|v| v / norm).collect()
 }
 
@@ -217,11 +223,8 @@ fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P, config: &Config) -> R
 
 type DynF32Array = ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::IxDyn>;
 
-fn preprocess_image<P: AsRef<Path>>(path: P, config: &Config) -> Result<DynF32Array> {
+fn preprocess_image(img: image::DynamicImage, config: &Config) -> Result<DynF32Array> {
     let minfo = config.clip_model.model_info();
-    let img = image::io::Reader::open(&path)?
-        .with_guessed_format()?
-        .decode()?;
     let img = img.resize_exact(minfo.image_dim.0, minfo.image_dim.1, FilterType::Gaussian);
     let ibuf = img.to_rgb32f();
     let fs = ibuf.as_flat_samples();
@@ -236,6 +239,41 @@ fn preprocess_image<P: AsRef<Path>>(path: P, config: &Config) -> Result<DynF32Ar
     let ndimg = ndimg.permuted_axes([2, 1, 0]);
 
     Ok(ndimg.into_dyn().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::preprocess_image;
+
+    #[test]
+    fn prep_test_rgbnorm() {
+        let blimg = image::Rgb32FImage::new(224, 224);
+        let prepped = preprocess_image(
+            blimg.into(),
+            &crate::Config {
+                clip_model: crate::PretrainedCLIP::VitL14Datacomp,
+                collections: Default::default(),
+                db_path: Default::default(),
+                gpu_id: None,
+            },
+        );
+        eprintln!("prepped black: {:?}", prepped);
+    }
+
+    #[test]
+    fn prep_test_mononorm() {
+        let blimg = image::Rgb32FImage::new(384, 384);
+        let prepped = preprocess_image(
+            blimg.into(),
+            &crate::Config {
+                clip_model: crate::PretrainedCLIP::VitL16SiglipWebli,
+                collections: Default::default(),
+                db_path: Default::default(),
+                gpu_id: None,
+            },
+        );
+        eprintln!("prepped black: {:?}", prepped);
+    }
 }
 
 fn embed_images(
@@ -349,16 +387,28 @@ impl TextEmbedder {
             modelinfo,
         })
     }
-    fn embed_and_norm(&mut self, inp: &str) -> Result<Vec<f32>> {
-        let sot = self.modelinfo.text_tokenizer_bos.as_ref().map(|t| self.tokenizer.token_to_id(t).unwrap());
-        let eot = self.tokenizer.token_to_id(&self.modelinfo.text_tokenizer_eos).unwrap();
-        let pad = self.tokenizer.token_to_id(&self.modelinfo.text_tokenizer_pad).unwrap();
+    fn embed_text(&mut self, inp: &str) -> Result<Vec<f32>> {
+        let sot = self
+            .modelinfo
+            .text_tokenizer_bos
+            .as_ref()
+            .map(|t| self.tokenizer.token_to_id(t).unwrap());
+        let eot = self
+            .tokenizer
+            .token_to_id(&self.modelinfo.text_tokenizer_eos)
+            .unwrap();
+        let pad = self
+            .tokenizer
+            .token_to_id(&self.modelinfo.text_tokenizer_pad)
+            .unwrap();
         let query = self
             .tokenizer
             .encode(inp, false)
             .map_err(|e| eyre!("{e:?}"))?;
         self.input_ids.clear();
-        if let Some(sot) = sot { self.input_ids.push(sot as i64); }
+        if let Some(sot) = sot {
+            self.input_ids.push(sot as i64);
+        }
         self.input_ids
             .extend(query.get_ids().iter().map(|v| *v as i64));
         self.input_ids.push(eot as i64);
@@ -373,7 +423,6 @@ impl TextEmbedder {
         let result = session.run(vec![ort::Value::from_array(session.allocator(), &ids)?])?;
         let emb: ort::tensor::OrtOwnedTensor<f32, _> = result[0].try_extract()?;
         let embv: Vec<f32> = emb.view().iter().copied().collect();
-        let embv = normalize(&embv);
         Ok(embv)
     }
 }
@@ -388,7 +437,7 @@ fn search_db(db: Arc<Mutex<Database>>, config: &Config, query: String) -> Result
     let mut te = TextEmbedder::new(config)?;
 
     {
-        let embv = te.embed_and_norm(&query)?;
+        let embv = te.embed_text(&query)?;
         let embv = normalize(&embv);
 
         let db = db.lock().unwrap();
@@ -397,13 +446,17 @@ fn search_db(db: Arc<Mutex<Database>>, config: &Config, query: String) -> Result
             .iter()
             .filter_map(|(k, v)| Some((v.embedding_id?, k)))
             .collect();
-        let mut scores = Vec::new();
-        for (dbi, dbv) in db.clip_embeddings.iter().enumerate() {
-            let ndbv = normalize(dbv);
-            let dist = ip_dist(&embv, &ndbv);
-            scores.push((dist, dbi));
-        }
-        scores.sort_by_key(|(d, _)| NotNan::new(*d).unwrap());
+        let mut scores: Vec<_> = db
+            .clip_embeddings
+            .iter()
+            .enumerate()
+            .map(|(dbi, dbv)| {
+                let ndbv = normalize(dbv);
+                let dist = cos_sim(&embv, &ndbv);
+                (dist, dbi)
+            })
+            .collect();
+        scores.sort_by_key(|(d, _)| Reverse(NotNan::new(*d).unwrap()));
         for (dist, eid) in scores.iter().take(5) {
             let oid = eid_to_oid.get(eid).expect("eid-to-oid");
             let obj = db.by_id.get(oid).expect("by-id");
@@ -419,7 +472,7 @@ struct AppState {
     query_cache: Arc<Mutex<lru::LruCache<String, Vec<(f32, usize)>>>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct SearchParams {
     query: String,
     limit: Option<usize>,
@@ -451,28 +504,61 @@ async fn handle_search(
     let limit = params.limit.unwrap_or(5);
 
     let scores = {
-        let hit = state.query_cache.lock().unwrap().get(&params.query).cloned();
+        let hit = state
+            .query_cache
+            .lock()
+            .unwrap()
+            .get(&params.query)
+            .cloned();
         if let Some(scores) = hit {
-            eprintln!("cache hit for {}", &params.query);
+            eprintln!("(hit) {:?}", &params);
             Ok::<_, color_eyre::Report>(scores.clone())
         } else {
+            eprintln!("(miss) {:?}", &params);
             let query = params.query.clone();
             let scores: Vec<(f32, usize)> = tokio::task::spawn_blocking(move || -> Result<_> {
-                let mut te = te.lock().unwrap();
-                let embv = te.embed_and_norm(&query)?;
-                let embv = normalize(&embv);
+                let embv = if query.starts_with("similar:") {
+                    let (_, oid) = query.trim().split_once(':').ok_or_else(|| eyre!("split"))?;
+                    if oid.is_empty() {
+                        bail!("empty oid");
+                    }
+                    let db = db.lock().unwrap();
+                    let oid: [u8; 32] = SerHex::<Strict>::from_hex(oid)?;
+                    let oid = ObjectId { data: oid };
+                    if let Some(obj) = db.by_id.get(&oid) {
+                        if let Some(eid) = obj.embedding_id {
+                            if let Some(emb) = db.clip_embeddings.get(eid) {
+                                //normalize(emb)
+                                emb.clone()
+                            } else {
+                                bail!("no embedding");
+                            }
+                        } else {
+                            bail!("no eid");
+                        }
+                    } else {
+                        bail!("no object");
+                    }
+                } else {
+                    let mut te = te.lock().unwrap();
+                    te.embed_text(&query)?
+                };
 
                 let db = db.lock().unwrap();
-                let mut scores = Vec::new();
-                for (dbi, dbv) in db.clip_embeddings.iter().enumerate() {
-                    let ndbv = normalize(dbv);
-                    let dist = ip_dist(&embv, &ndbv);
-                    scores.push((dist, dbi));
-                }
-                scores.sort_by_key(|(d, _)| NotNan::new(*d).unwrap());
+                let mut scores: Vec<_> = db
+                    .clip_embeddings
+                    .iter()
+                    .enumerate()
+                    .map(|(dbi, dbv)| {
+                        let dist = cos_sim(&embv, dbv);
+                        (dist, dbi)
+                    })
+                    .collect();
+                scores.sort_by_key(|(d, _)| Reverse(NotNan::new(*d).unwrap()));
                 Ok(scores)
             })
-            .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
             state
@@ -607,7 +693,13 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
                             .unwrap(),
                     )
                     .for_each(|(id, path)| {
-                        let r = preprocess_image(path, config);
+                        let r = (|| -> Result<_> {
+                            let img = image::io::Reader::open(path)?
+                                .with_guessed_format()?
+                                .decode()?;
+                            preprocess_image(img, config)
+                        })();
+
                         match r {
                             Ok(embedding) => {
                                 tx.send(Ok((id.to_owned(), embedding))).unwrap();
@@ -641,6 +733,7 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
                 }
                 if !imgbatch.is_empty() {
                     let mut embeddings = embed_images(&mut clip_visual_session, imgbatch)?;
+                    embeddings = embeddings.into_iter().map(|e| normalize(&e)).collect();
                     let mut db = db.lock().unwrap();
                     let sidx = db.clip_embeddings.len();
                     db.clip_embeddings.append(&mut embeddings);
@@ -649,7 +742,6 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
                     }
                 }
             }
-            //preproc_thread.join().map_err(|e| eyre!("{e:?}"))?;
             Ok(())
         })?;
         db.lock().unwrap().persist(config)?;

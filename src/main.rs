@@ -4,21 +4,22 @@ use color_eyre::{
     Result,
 };
 use image::imageops::FilterType;
-use indicatif::{ParallelProgressIterator, ProgressStyle};
+
+use indicatif::ProgressDrawTarget;
 use jwalk::WalkDir;
+
 use serde_hex::{SerHex, Strict};
 
 use ordered_float::NotNan;
-use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use sha2::Digest;
 use std::{
     borrow::Cow,
     cmp::Reverse,
     collections::HashMap,
-    io::Write,
+    io::{Seek, Write},
     num::NonZeroUsize,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -77,25 +78,12 @@ impl Write for HasherWriter {
     }
 }
 
-fn compute_id(loc: ObjectLocation) -> Result<ObjectId> {
-    match loc {
-        ObjectLocation::LocalPath(p) => {
-            let fh = std::fs::File::open(p)?;
-            let mut hw = blake3::Hasher::new();
-            hw.update_reader(fh)?;
-            Ok(ObjectId {
-                data: hw.finalize().into(),
-            })
-        }
-    }
-}
-
-fn l2dist(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(a, b)| (a - b).powf(2.0))
-        .sum::<f32>()
-        .sqrt()
+fn compute_id_file(fh: &mut std::fs::File) -> Result<ObjectId> {
+    let mut hw = blake3::Hasher::new();
+    hw.update_reader(fh)?;
+    Ok(ObjectId {
+        data: hw.finalize().into(),
+    })
 }
 
 fn cos_sim(a: &[f32], b: &[f32]) -> f32 {
@@ -111,8 +99,16 @@ fn normalize(inp: &Vec<f32>) -> Vec<f32> {
 }
 
 impl Database {
-    fn has(&self, loc: &ObjectLocation) -> bool {
-        self.id_by_loc.contains_key(loc)
+    fn has_embedding(&self, loc: &ObjectLocation) -> bool {
+        if let Some(oid) = self.id_by_loc.get(loc) {
+            if let Some(obj) = self.by_id.get(oid) {
+                obj.embedding_id.is_some()
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
     fn insert(&mut self, loc: ObjectLocation, id: ObjectId, obj: Object) {
         self.by_id.insert(id, obj);
@@ -131,44 +127,6 @@ impl Database {
         std::fs::rename(temppath, dbpath)?;
         Ok(())
     }
-}
-fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P, config: &Config) -> Result<()> {
-    let mut scanned = Vec::new();
-
-    for entry in WalkDir::new(root) {
-        let path = entry?.path();
-        let loc = match path.extension().and_then(|s| s.to_str()) {
-            Some("jpg") | Some("jpeg") | Some("png") => {
-                ObjectLocation::LocalPath(std::fs::canonicalize(path)?)
-            }
-            _ => continue,
-        };
-        scanned.push(loc);
-    }
-    let scanned: Vec<ObjectLocation> = {
-        let db = db.lock().expect("lock");
-        scanned.into_iter().filter(|i| !db.has(i)).collect()
-    };
-    eprintln!("Found {} new items.", scanned.len());
-    eprintln!("Hashing...");
-
-    scanned
-        .into_par_iter()
-        .map(|l| -> Result<_> { Ok((l.clone(), compute_id(l)?)) })
-        .progress()
-        .for_each(|idc| {
-            let (p, oid) = idc.expect("hashing failed");
-            let obj = Object {
-                locations: vec![p.clone()],
-                ..Default::default()
-            };
-            let mut db = db.lock().expect("lock");
-            db.insert(p, oid, obj);
-        });
-
-    db.lock().unwrap().persist(config)?;
-
-    Ok(())
 }
 
 type DynF32Array = ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::IxDyn>;
@@ -238,8 +196,12 @@ enum Commands {
     UpdateDb {
         #[arg(short, long)]
         media_dirs: Vec<PathBuf>,
-        #[arg(short, long, default_value="8")]
+        #[arg(short, long, default_value = "8")]
         batch_size: usize,
+        #[arg(short, long, default_value = "false")]
+        tensorrt: bool,
+        #[arg(short, long, default_value = "2")]
+        readers: usize,
     },
     Serve,
     Search {
@@ -271,8 +233,13 @@ fn main() -> color_eyre::Result<()> {
         Some(Commands::Serve) => {
             serve_search(get_db()?, &config)?;
         }
-        Some(Commands::UpdateDb { media_dirs, batch_size }) => {
-            update_db(get_db()?, &config, &media_dirs, batch_size)?;
+        Some(Commands::UpdateDb {
+            media_dirs,
+            batch_size,
+            tensorrt,
+            readers
+        }) => {
+            update_db(get_db()?, &config, &media_dirs, batch_size, tensorrt, readers)?;
         }
         Some(Commands::Search { query }) => {
             search_db(get_db()?, &config, query)?;
@@ -405,10 +372,11 @@ fn search_db(db: Arc<Mutex<Database>>, config: &Config, query: String) -> Result
     Ok(())
 }
 
+type QueryCache = lru::LruCache<String, Vec<(f32, usize)>>;
 struct AppState {
     te: Arc<Mutex<TextEmbedder>>,
     db: Arc<Mutex<Database>>,
-    query_cache: Arc<Mutex<lru::LruCache<String, Vec<(f32, usize)>>>>,
+    query_cache: Arc<Mutex<QueryCache>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -566,22 +534,144 @@ fn serve_search(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn update_db(db: Arc<Mutex<Database>>, config: &Config, scan_paths: &[PathBuf], batch_size: usize) -> Result<()> {
+fn update_db(
+    db: Arc<Mutex<Database>>,
+    config: &Config,
+    scan_paths: &[PathBuf],
+    batch_size: usize,
+    use_tensorrt: bool,
+    readers: usize,
+) -> Result<()> {
     eprintln!("Db has {} items.", db.lock().unwrap().by_id.len());
     eprintln!("Scanning...");
-    for root in scan_paths.iter() {
-        scan(db.clone(), root, config)?;
-    }
+    let mut scanned = Vec::new();
     let gpu_id = config.gpu_id;
     let minfo = &config.model_info;
     let vpath = PathBuf::from("clip_models").join(format!(
         "{}_{}_visual.onnx",
         minfo.arch_name, minfo.pretrain_name
     ));
-    let ortenv = ort::Environment::builder()
-        .with_name("clip")
-        .with_execution_providers([
-            ort::ExecutionProvider::TensorRT(
+    for root in scan_paths.iter() {
+        for entry in WalkDir::new(root) {
+            let path = entry?.path();
+            let loc = match path.extension().and_then(|s| s.to_str()) {
+                Some("jpg") | Some("jpeg") | Some("png") => {
+                    ObjectLocation::LocalPath(std::fs::canonicalize(path)?)
+                }
+                _ => continue,
+            };
+            scanned.push(loc);
+        }
+    }
+    let scanned: Vec<ObjectLocation> = {
+        let db = db.lock().expect("lock");
+        scanned
+            .into_iter()
+            .filter(|i| !db.has_embedding(i))
+            .collect()
+    };
+    eprintln!("Found {} unembedded items.", scanned.len());
+    eprintln!("Processing...");
+
+    let hasher_tasks = readers;
+    let preprocess_tasks: usize = std::thread::available_parallelism()?.get();
+    let db_inside = db.clone();
+    rayon::scope(move |s| {
+        let mp = indicatif::MultiProgress::new();
+        mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(30));
+        let style = indicatif::ProgressStyle::default_bar()
+            .template("{prefix} {wide_bar} {per_sec:<9} {eta} {pos:>7}/{len}")
+            .unwrap();
+        let pb_hash = mp
+            .add(indicatif::ProgressBar::new(scanned.len() as u64))
+            .with_style(style.clone())
+            .with_prefix("   hash");
+        let pb_rsz = mp
+            .add(indicatif::ProgressBar::new(scanned.len() as u64))
+            .with_style(style.clone())
+            .with_prefix("prepare");
+        let pb_emb = mp
+            .add(indicatif::ProgressBar::new(scanned.len() as u64))
+            .with_style(style.clone())
+            .with_prefix("  embed");
+        let db = db_inside;
+        let prep_r = {
+            let (fp_s, fp_r) = crossbeam_channel::bounded(hasher_tasks * 2);
+            let (fpi_s, fpi_r) = crossbeam_channel::bounded(preprocess_tasks * 2);
+            let (prep_s, prep_r) = crossbeam_channel::bounded(batch_size * 2);
+
+            s.spawn(move |_| {
+                for loc in scanned {
+                    let ObjectLocation::LocalPath(ref p) = loc;
+                    if let Ok(fp) = std::fs::File::open(p) {
+                        fp_s.send((loc, fp)).unwrap();
+                    } else {
+                        log::warn!("failed to read file: {p:?}");
+                    }
+                }
+            });
+
+            (0..hasher_tasks).for_each(|_| {
+                let fp_r = fp_r.clone();
+                let fpi_s = fpi_s.clone();
+                let db = db.clone();
+                let pbh = pb_hash.clone();
+                s.spawn(move |_| {
+                    while let Ok((loc, mut fp)) = fp_r.recv() {
+                        if let Ok(oid) = compute_id_file(&mut fp) {
+                            {
+                                pbh.inc(1);
+                                let mut db = db.lock().unwrap();
+                                db.insert(
+                                    loc.clone(),
+                                    oid,
+                                    Object {
+                                        locations: vec![loc],
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            fpi_s.send((oid, fp)).unwrap();
+                        } else {
+                            pbh.inc(1);
+
+                            log::warn!("error hashing file: {loc:?}");
+                        }
+                    }
+                })
+            });
+
+            (0..preprocess_tasks).for_each(|_| {
+                let fpi_r = fpi_r.clone();
+                let prep_s = prep_s.clone();
+                let pb_rsz = pb_rsz.clone();
+                s.spawn(move |_| {
+                    while let Ok((oid, mut fp)) = fpi_r.recv() {
+                        fp.rewind().expect("rewind");
+                        if let Ok(img) = image::io::Reader::new(std::io::BufReader::new(fp))
+                            .with_guessed_format()
+                            .unwrap()
+                            .decode()
+                        {
+                            pb_rsz.inc(1);
+                            if let Ok(procd) = preprocess_image(img, config) {
+                                prep_s.send((oid, procd)).unwrap();
+                            } else {
+                                log::warn!("Failed to process image for oid: {oid:?}");
+                            }
+                        } else {
+                            pb_rsz.inc(1);
+
+                            log::warn!("Failed to read image for oid: {oid:?}");
+                        }
+                    }
+                })
+            });
+            prep_r
+        };
+        let mut eps = vec![];
+        if use_tensorrt {
+            eps.push(ort::ExecutionProvider::TensorRT(
                 ort::execution_providers::TensorRTExecutionProviderOptions {
                     device_id: gpu_id,
                     fp16_enable: true,
@@ -589,100 +679,74 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config, scan_paths: &[PathBuf], 
                     engine_cache_path: "./engine_cache".to_owned(),
                     ..Default::default()
                 },
-            ),
-            ort::ExecutionProvider::CUDA(ort::execution_providers::CUDAExecutionProviderOptions {
+            ));
+        }
+        eps.push(ort::ExecutionProvider::CUDA(
+            ort::execution_providers::CUDAExecutionProviderOptions {
                 device_id: gpu_id,
                 ..Default::default()
-            }),
-            ort::ExecutionProvider::CPU(Default::default()),
-        ])
-        .build()?
-        .into_arc();
-    let mut clip_visual_session = ort::SessionBuilder::new(&ortenv)?
-        .with_optimization_level(ort::GraphOptimizationLevel::Level3)?
-        .with_model_from_file(vpath)?;
+            },
+        ));
+        eps.push(ort::ExecutionProvider::CPU(Default::default()));
 
-    {
-        eprintln!("Embedding...");
-        let path_and_ids: Vec<(ObjectId, String)> = db
-            .lock()
-            .unwrap()
-            .by_id
-            .iter()
-            .filter(|(_, obj)| obj.embedding_id.is_none())
-            .map(|(id, obj)| {
-                (
-                    *id,
-                    match obj.locations[0].clone() {
-                        ObjectLocation::LocalPath(p) => p.to_string_lossy().to_string(),
-                    },
-                )
-            })
-            .collect();
-        let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        std::thread::scope(|s| -> Result<()> {
-            s.spawn(move || {
-                path_and_ids
-                    .par_iter()
-                    .progress_with_style(
-                        ProgressStyle::default_bar()
-                            .template("{wide_bar} {per_sec} {eta} {elapsed}")
-                            .unwrap(),
-                    )
-                    .for_each(|(id, path)| {
-                        let r = (|| -> Result<_> {
-                            let img = image::io::Reader::open(path)?
-                                .with_guessed_format()?
-                                .decode()?;
-                            preprocess_image(img, config)
-                        })();
-
-                        match r {
-                            Ok(embedding) => {
-                                tx.send(Ok((id.to_owned(), embedding))).unwrap();
-                            }
-                            Err(e) => {
-                                tx.send(Err(e)).unwrap();
-                            }
-                        }
-                    });
-            });
-            let bs = batch_size;
-            let mut done = false;
-            while !done {
-                let mut imgbatch = vec![];
-                let mut ids = vec![];
-                loop {
-                    match rx.recv() {
-                        Ok(msg) => {
-                            let (oid, preprocd) = msg?;
-                            ids.push(oid);
-                            imgbatch.push(preprocd);
-                        }
-                        Err(_e) => {
-                            done = true;
-                            break;
-                        }
-                    }
-                    if imgbatch.len() >= bs {
+        let ortenv = ort::Environment::builder()
+            .with_name("clip")
+            .with_execution_providers(&eps)
+            .build()
+            .expect("ort")
+            .into_arc();
+        let mut clip_visual_session = ort::SessionBuilder::new(&ortenv)
+            .expect("ort")
+            .with_optimization_level(ort::GraphOptimizationLevel::Level2)
+            .expect("ort")
+            .with_model_from_file(vpath)
+            .expect("ort");
+        let mut done = false;
+        let commit_every = 1000;
+        let mut uncommitted = 0;
+        while !done {
+            let mut batch = vec![];
+            let mut ids = vec![];
+            loop {
+                if let Ok((oid, prepped)) = prep_r.recv() {
+                    batch.push(prepped);
+                    ids.push(oid);
+                    if batch.len() >= batch_size {
                         break;
                     }
+                } else {
+                    done = true;
+                    break;
                 }
-                if !imgbatch.is_empty() {
-                    let mut embeddings = embed_images(&mut clip_visual_session, imgbatch)?;
+            }
+            if !batch.is_empty() {
+                if use_tensorrt && batch.len() != batch_size {
+                    // pad the final batch to avoid making TensorRT generate extra kernels
+                    batch.resize(batch_size, batch[0].clone());
+                }
+                if let Ok(mut embeddings) = embed_images(&mut clip_visual_session, batch) {
+                    pb_emb.inc(embeddings.len() as u64);
                     embeddings = embeddings.into_iter().map(|e| normalize(&e)).collect();
+                    embeddings.truncate(ids.len()); // in case we padded the batch
                     let mut db = db.lock().unwrap();
                     let sidx = db.clip_embeddings.len();
                     db.clip_embeddings.append(&mut embeddings);
                     for (oid, eid) in ids.iter().zip(sidx..) {
                         db.by_id.get_mut(oid).unwrap().embedding_id = Some(eid);
+                        uncommitted += 1;
                     }
+                    if uncommitted >= commit_every {
+                        db.persist(config).expect("commit");
+                        uncommitted = 0;
+                    }
+                } else {
+                    log::error!("failed to compute embedding batch, abort!");
+                    done = true;
                 }
             }
-            Ok(())
-        })?;
-        db.lock().unwrap().persist(config)?;
-    }
+        }
+    });
+    db.lock().unwrap().persist(config)?;
 
     Ok(())
 }

@@ -228,7 +228,7 @@ struct Args {
     model_config: PathBuf,
     #[arg(short, long, default_value = "./db")]
     db_path: PathBuf,
-    #[arg(short, long, default_value = "1")]
+    #[arg(short, long, default_value = "0")]
     gpu_id: u32,
     #[command(subcommand)]
     command: Option<Commands>,

@@ -31,3 +31,4 @@ axum = { version = "0.6.20", features = ["macros"] }
 tokio = { version = "1.33.0", features = ["full"] }
 url = { version = "2.4.1", features = ["serde"] }
 serde-hex = "0.1.0"
+lru = "0.12.0"

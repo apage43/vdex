@@ -3,9 +3,8 @@ use color_eyre::{eyre::eyre, Result};
 use image::imageops::FilterType;
 use indicatif::{ParallelProgressIterator, ProgressStyle};
 use jwalk::WalkDir;
-use serde_hex::{Compact, SerHex, Strict};
+use serde_hex::{SerHex, Strict};
 
-use ndarray::{Data, CowArray};
 use norman::special::NormEucl;
 use ordered_float::NotNan;
 use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -15,6 +14,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     io::Write,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -28,7 +28,9 @@ struct CLIPModelInfo {
     image_mean: (f32, f32, f32),
     image_std: (f32, f32, f32),
     text_tokenizer_hub_name: Cow<'static, str>,
-    text_tokenizer_pad_id: u32,
+    text_tokenizer_bos: Option<Cow<'static, str>>,
+    text_tokenizer_pad: Cow<'static, str>,
+    text_tokenizer_eos: Cow<'static, str>,
     text_input_size: usize,
     arch_name: Cow<'static, str>,
     pretrain_name: Cow<'static, str>,
@@ -48,20 +50,24 @@ impl PretrainedCLIP {
                 image_mean: (0.5, 0.5, 0.5),
                 image_std: (0.5, 0.5, 0.5),
                 text_tokenizer_hub_name: "timm/ViT-L-16-SigLIP-384".into(),
-                text_tokenizer_pad_id: 1,
+                text_tokenizer_pad: "</s>".into(),
+                text_tokenizer_eos: "</s>".into(),
                 text_input_size: 64,
                 arch_name: "ViT-L-16-SigLIP-384".into(),
                 pretrain_name: "webli".into(),
+                text_tokenizer_bos: None,
             },
             PretrainedCLIP::VitL14Datacomp => CLIPModelInfo {
                 image_dim: (224, 224),
                 image_mean: (0.48145466, 0.4578275, 0.40821073),
                 image_std: (0.26862954, 0.261_302_6, 0.275_777_1),
                 text_tokenizer_hub_name: "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K".into(),
-                text_tokenizer_pad_id: 0,
+                text_tokenizer_eos: "<|endoftext|>".into(),
                 text_input_size: 77,
                 arch_name: "ViT-L-14".into(),
                 pretrain_name: "datacomp_xl_s13b_b90k".into(),
+                text_tokenizer_bos: Some( "<|startoftext|>".into()),
+                text_tokenizer_pad: todo!(),
             },
         }
     }
@@ -76,6 +82,7 @@ struct Collection {
 struct Config {
     clip_model: PretrainedCLIP,
     collections: HashMap<String, Collection>,
+    db_path: PathBuf,
     gpu_id: Option<u32>,
 }
 
@@ -155,16 +162,21 @@ impl Database {
         self.by_id.insert(id, obj);
         self.id_by_loc.insert(loc, id);
     }
-    fn persist(&self) -> Result<()> {
+    fn persist(&self, config: &Config) -> Result<()> {
         let encoded = bincode::serialize(self)?;
-        let mut outf = std::fs::File::create("db.temp.bc")?;
+        if !config.db_path.exists() {
+            std::fs::create_dir(&config.db_path)?
+        }
+        let temppath = config.db_path.join("db.bc.new");
+        let dbpath = config.db_path.join("db.bc");
+        let mut outf = std::fs::File::create(&temppath)?;
         let mut rdbslice = &encoded[..];
         std::io::copy(&mut rdbslice, &mut outf)?;
-        std::fs::rename("db.temp.bc", "db.bc")?;
+        std::fs::rename(temppath, dbpath)?;
         Ok(())
     }
 }
-fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P) -> Result<()> {
+fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P, config: &Config) -> Result<()> {
     let mut scanned = Vec::new();
 
     for entry in WalkDir::new(root) {
@@ -198,7 +210,7 @@ fn scan<P: AsRef<Path>>(db: Arc<Mutex<Database>>, root: P) -> Result<()> {
             db.insert(p, oid, obj);
         });
 
-    db.lock().unwrap().persist()?;
+    db.lock().unwrap().persist(config)?;
 
     Ok(())
 }
@@ -217,11 +229,12 @@ fn preprocess_image<P: AsRef<Path>>(path: P, config: &Config) -> Result<DynF32Ar
         (minfo.image_dim.0 as usize, minfo.image_dim.1 as usize, 3),
         fs.samples,
     )?;
-    let ndimg = ndimg.permuted_axes([2, 1, 0]);
-    let nmean = ndarray::array![minfo.image_mean.0, minfo.image_mean.1, minfo.image_mean.2].into_shape((3,1,1))?;
-    let nstd = ndarray::array![minfo.image_std.0, minfo.image_std.1, minfo.image_std.2].into_shape((3,1,1))?;
+    let nmean = ndarray::array![minfo.image_mean.0, minfo.image_mean.1, minfo.image_mean.2];
+    let nstd = ndarray::array![minfo.image_std.0, minfo.image_std.1, minfo.image_std.2];
     let ndimg = ndimg.to_owned() - nmean;
     let ndimg = ndimg / nstd;
+    let ndimg = ndimg.permuted_axes([2, 1, 0]);
+
     Ok(ndimg.into_dyn().into_owned())
 }
 
@@ -230,7 +243,6 @@ fn embed_images(
     images: Vec<DynF32Array>,
 ) -> Result<Vec<Vec<f32>>> {
     let views: Vec<_> = images.iter().map(|i| i.view()).collect();
-    //let batch = ndarray::concatenate(ndarray::Axis(0), &views[..])?;
     let batch = ndarray::stack(ndarray::Axis(0), &views[..])?;
     let prep = ndarray::CowArray::from(batch);
     let ov = ort::Value::from_array(clip_session.allocator(), &prep)?;
@@ -248,6 +260,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 struct Args {
+    #[arg(short, long, value_name = "FILE")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -260,17 +274,19 @@ enum Commands {
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt::init();
-    let config_raw = std::fs::read_to_string("config.toml")?;
+    let args = Args::parse();
+
+    let config_raw =
+        std::fs::read_to_string(args.config.unwrap_or_else(|| PathBuf::from("config.toml")))?;
     let config: Config = toml::from_str(&config_raw)?;
     let get_db = || {
-        let db: Database = match std::fs::read("db.bc") {
+        let db: Database = match std::fs::read(config.db_path.join("db.bc")) {
             Ok(fbsrc) => bincode::deserialize(&fbsrc)?,
             _ => Database::default(),
         };
         let db = Arc::new(Mutex::new(db));
         Ok::<_, color_eyre::Report>(db)
     };
-    let args = Args::parse();
     match args.command {
         None => {
             Args::command().print_help()?;
@@ -299,8 +315,11 @@ impl TextEmbedder {
     fn new(config: &Config) -> Result<Self> {
         let gpu_id = config.gpu_id.unwrap_or(0);
         let modelinfo = config.clip_model.model_info();
-        let tpath = PathBuf::from("clip_models").join(format!("{}_{}_text.onnx", modelinfo.arch_name, modelinfo.pretrain_name));
-    
+        let tpath = PathBuf::from("clip_models").join(format!(
+            "{}_{}_text.onnx",
+            modelinfo.arch_name, modelinfo.pretrain_name
+        ));
+
         let ortenv = ort::Environment::builder()
             .with_name("clip-text")
             .with_execution_providers([
@@ -319,8 +338,9 @@ impl TextEmbedder {
                 .with_optimization_level(ort::GraphOptimizationLevel::Level1)?
                 .with_model_from_file(tpath)?,
         );
-        let tokenizer = tokenizers::Tokenizer::from_pretrained(modelinfo.text_tokenizer_hub_name.clone(), None)
-            .map_err(|e| eyre!("{e:?}"))?;
+        let tokenizer =
+            tokenizers::Tokenizer::from_pretrained(modelinfo.text_tokenizer_hub_name.clone(), None)
+                .map_err(|e| eyre!("{e:?}"))?;
         Ok(TextEmbedder {
             _ortenv: ortenv,
             session,
@@ -330,20 +350,22 @@ impl TextEmbedder {
         })
     }
     fn embed_and_norm(&mut self, inp: &str) -> Result<Vec<f32>> {
-        let encd = self
+        let sot = self.modelinfo.text_tokenizer_bos.as_ref().map(|t| self.tokenizer.token_to_id(t).unwrap());
+        let eot = self.tokenizer.token_to_id(&self.modelinfo.text_tokenizer_eos).unwrap();
+        let pad = self.tokenizer.token_to_id(&self.modelinfo.text_tokenizer_pad).unwrap();
+        let query = self
             .tokenizer
-            .with_padding(Some(PaddingParams {
-                strategy: tokenizers::PaddingStrategy::Fixed(self.modelinfo.text_input_size),
-                pad_id: self.modelinfo.text_tokenizer_pad_id,
-                ..Default::default()
-            }))
             .encode(inp, false)
             .map_err(|e| eyre!("{e:?}"))?;
-        //eprintln!("Encoded query: {encd:?}");
         self.input_ids.clear();
+        if let Some(sot) = sot { self.input_ids.push(sot as i64); }
         self.input_ids
-            .extend(encd.get_ids().iter().map(|v| *v as i64));
-        //eprintln!("ids: {ids:?}");
+            .extend(query.get_ids().iter().map(|v| *v as i64));
+        self.input_ids.push(eot as i64);
+        self.input_ids
+            .resize(self.modelinfo.text_input_size, pad as i64);
+
+        eprintln!("Encoded query: {:?}", self.input_ids);
         let ids = ndarray::CowArray::from(&self.input_ids)
             .into_shape((1, self.modelinfo.text_input_size))?
             .into_dyn();
@@ -394,6 +416,7 @@ fn search_db(db: Arc<Mutex<Database>>, config: &Config, query: String) -> Result
 struct AppState {
     te: Arc<Mutex<TextEmbedder>>,
     db: Arc<Mutex<Database>>,
+    query_cache: Arc<Mutex<lru::LruCache<String, Vec<(f32, usize)>>>>,
 }
 
 #[derive(Deserialize)]
@@ -417,6 +440,7 @@ struct NNSearchResponse {
     more: bool,
 }
 
+#[axum::debug_handler]
 async fn handle_search(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     params: axum::extract::Query<SearchParams>,
@@ -425,49 +449,73 @@ async fn handle_search(
     let db = state.db.clone();
     let skip = params.skip.unwrap_or(0);
     let limit = params.limit.unwrap_or(5);
-    let res = tokio::task::spawn_blocking(move || -> Result<_> {
-        let mut te = te.lock().unwrap();
-        let embv = te.embed_and_norm(&params.query)?;
-        let embv = normalize(&embv);
 
-        let db = db.lock().unwrap();
-        let eid_to_oid: HashMap<_, _> = db
-            .by_id
-            .iter()
-            .filter_map(|(k, v)| Some((v.embedding_id?, k)))
-            .collect();
-        let mut scores = Vec::new();
-        for (dbi, dbv) in db.clip_embeddings.iter().enumerate() {
-            let ndbv = normalize(dbv);
-            let dist = ip_dist(&embv, &ndbv);
-            scores.push((dist, dbi));
-        }
-        scores.sort_by_key(|(d, _)| NotNan::new(*d).unwrap());
-        let rv = scores
-            .iter()
-            .skip(skip)
-            .take(limit)
-            .map(|(distance, eid)| {
-                let object_id = **eid_to_oid.get(eid).ok_or(eyre!("eid/oid"))?;
-                let object = db
-                    .by_id
-                    .get(&object_id)
-                    .ok_or(eyre!("oid mismatch"))?
-                    .clone();
-                let ObjectLocation::LocalPath(p) = object.locations[0].clone();
-                Ok(NNSearchResult {
-                    distance: *distance,
-                    object_id: object_id.data,
-                    path: url::Url::from_file_path(p).unwrap(),
-                })
+    let scores = {
+        let hit = state.query_cache.lock().unwrap().get(&params.query).cloned();
+        if let Some(scores) = hit {
+            eprintln!("cache hit for {}", &params.query);
+            Ok::<_, color_eyre::Report>(scores.clone())
+        } else {
+            let query = params.query.clone();
+            let scores: Vec<(f32, usize)> = tokio::task::spawn_blocking(move || -> Result<_> {
+                let mut te = te.lock().unwrap();
+                let embv = te.embed_and_norm(&query)?;
+                let embv = normalize(&embv);
+
+                let db = db.lock().unwrap();
+                let mut scores = Vec::new();
+                for (dbi, dbv) in db.clip_embeddings.iter().enumerate() {
+                    let ndbv = normalize(dbv);
+                    let dist = ip_dist(&embv, &ndbv);
+                    scores.push((dist, dbi));
+                }
+                scores.sort_by_key(|(d, _)| NotNan::new(*d).unwrap());
+                Ok(scores)
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(rv)
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            state
+                .query_cache
+                .lock()
+                .unwrap()
+                .put(params.query.clone(), scores.clone());
+            Ok(scores)
+        }
+    }
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(axum::Json(NNSearchResponse { items: res, more: skip+limit < state.db.lock().unwrap().by_id.len() }))
+
+    let db = state.db.lock().unwrap();
+    let eid_to_oid: HashMap<_, _> = db
+        .by_id
+        .iter()
+        .filter_map(|(k, v)| Some((v.embedding_id?, k)))
+        .collect();
+    let rv = scores
+        .iter()
+        .skip(skip)
+        .take(limit)
+        .map(|(distance, eid)| {
+            let object_id = **eid_to_oid.get(eid).ok_or(eyre!("eid/oid"))?;
+            let object = db
+                .by_id
+                .get(&object_id)
+                .ok_or(eyre!("oid mismatch"))?
+                .clone();
+            let ObjectLocation::LocalPath(p) = object.locations[0].clone();
+            Ok(NNSearchResult {
+                distance: *distance,
+                object_id: object_id.data,
+                path: url::Url::from_file_path(p).unwrap(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(axum::Json(NNSearchResponse {
+        items: rv,
+        more: skip + limit < db.by_id.len(),
+    }))
 }
 async fn serve(app: axum::Router, port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -481,6 +529,9 @@ fn serve_search(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
     let state = Arc::new(AppState {
         te: Arc::new(Mutex::new(TextEmbedder::new(config)?)),
         db,
+        query_cache: Arc::new(Mutex::new(lru::LruCache::new(
+            NonZeroUsize::new(5).unwrap(),
+        ))),
     });
     let app = axum::Router::new()
         .route("/search_text", axum::routing::get(handle_search))
@@ -495,12 +546,15 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
     eprintln!("Scanning...");
     for (_cname, coll) in config.collections.iter() {
         for root in coll.roots.iter() {
-            scan(db.clone(), root)?;
+            scan(db.clone(), root, config)?;
         }
     }
     let gpu_id = config.gpu_id.unwrap_or(0);
     let minfo = config.clip_model.model_info();
-    let vpath = PathBuf::from("clip_models").join(format!("{}_{}_visual.onnx", minfo.arch_name, minfo.pretrain_name));
+    let vpath = PathBuf::from("clip_models").join(format!(
+        "{}_{}_visual.onnx",
+        minfo.arch_name, minfo.pretrain_name
+    ));
     let ortenv = ort::Environment::builder()
         .with_name("clip")
         .with_execution_providers([
@@ -598,7 +652,7 @@ fn update_db(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
             //preproc_thread.join().map_err(|e| eyre!("{e:?}"))?;
             Ok(())
         })?;
-        db.lock().unwrap().persist()?;
+        db.lock().unwrap().persist(config)?;
     }
 
     Ok(())

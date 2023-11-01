@@ -578,11 +578,12 @@ fn update_db(
         minfo.arch_name, minfo.pretrain_name
     ));
     for root in scan_paths.iter() {
+        let root = std::fs::canonicalize(root)?;
         for entry in WalkDir::new(root) {
             let path = entry?.path();
             let loc = match path.extension().and_then(|s| s.to_str()) {
                 Some("jpg") | Some("jpeg") | Some("png") => {
-                    ObjectLocation::LocalPath(std::fs::canonicalize(path)?)
+                    ObjectLocation::LocalPath(path)
                 }
                 _ => continue,
             };

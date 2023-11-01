@@ -565,7 +565,11 @@ fn update_db(
     readers: usize,
 ) -> Result<()> {
     log::info!("Db has {} items.", db.lock().unwrap().by_id.len());
-    let pb = indicatif::ProgressBar::new_spinner().with_style(indicatif::ProgressStyle::default_spinner().template("{spinner} Scanning... {pos} files").unwrap());
+    let pb = indicatif::ProgressBar::new_spinner().with_style(
+        indicatif::ProgressStyle::default_spinner()
+            .template("{spinner} Scanning... {pos} files")
+            .unwrap(),
+    );
     let mut scanned = Vec::new();
     let gpu_id = config.gpu_id;
     let minfo = &config.model_info;
@@ -645,15 +649,17 @@ fn update_db(
                         if let Ok(oid) = compute_id_file(&mut fp) {
                             {
                                 pbh.inc(1);
-                                let mut db = db.lock().unwrap();
-                                db.insert(
-                                    loc.clone(),
-                                    oid,
-                                    Object {
-                                        locations: vec![loc.clone()],
-                                        ..Default::default()
-                                    },
-                                );
+                                {
+                                    let mut db = db.lock().unwrap();
+                                    db.insert(
+                                        loc.clone(),
+                                        oid,
+                                        Object {
+                                            locations: vec![loc.clone()],
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
                                 fpi_s.send((loc, oid, fp)).unwrap();
                             }
                         } else {
@@ -721,7 +727,9 @@ fn update_db(
             .into_arc();
         let mut clip_visual_session = ort::SessionBuilder::new(&ortenv)
             .expect("ort")
-            .with_optimization_level(ort::GraphOptimizationLevel::Level2)
+            .with_optimization_level(ort::GraphOptimizationLevel::Level3)
+            .expect("ort")
+            .with_memory_pattern(true)
             .expect("ort")
             .with_model_from_file(vpath)
             .expect("ort");
@@ -744,13 +752,12 @@ fn update_db(
                 }
             }
             if !batch.is_empty() {
-                if use_tensorrt && batch.len() != batch_size {
-                    // pad the final batch to avoid making TensorRT generate extra kernels
+                if batch.len() != batch_size {
+                    // enable constant batch size optimization
                     batch.resize(batch_size, batch[0].clone());
                 }
                 if let Ok(mut embeddings) = embed_images(&mut clip_visual_session, batch) {
-                    pb_emb.inc(embeddings.len() as u64);
-                    embeddings = embeddings.into_iter().map(|e| normalize(&e)).collect();
+                    //embeddings = embeddings.into_iter().map(|e| normalize(&e)).collect();
                     embeddings.truncate(ids.len()); // in case we padded the batch
                     let mut db = db.lock().unwrap();
                     let sidx = db.clip_embeddings.len();
@@ -759,6 +766,7 @@ fn update_db(
                         db.by_id.get_mut(oid).unwrap().embedding_id = Some(eid);
                         uncommitted += 1;
                     }
+                    pb_emb.inc(ids.len() as u64);
                     if uncommitted >= commit_every {
                         db.persist(config).expect("commit");
                         uncommitted = 0;

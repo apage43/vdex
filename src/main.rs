@@ -237,9 +237,16 @@ fn main() -> color_eyre::Result<()> {
             media_dirs,
             batch_size,
             tensorrt,
-            readers
+            readers,
         }) => {
-            update_db(get_db()?, &config, &media_dirs, batch_size, tensorrt, readers)?;
+            update_db(
+                get_db()?,
+                &config,
+                &media_dirs,
+                batch_size,
+                tensorrt,
+                readers,
+            )?;
         }
         Some(Commands::Search { query }) => {
             search_db(get_db()?, &config, query)?;
@@ -321,7 +328,7 @@ impl TextEmbedder {
         self.input_ids
             .resize(self.modelinfo.text_input_size, pad as i64);
 
-        eprintln!("Encoded query: {:?}", self.input_ids);
+        log::info!("Encoded query: {:?}", self.input_ids);
         let ids = ndarray::CowArray::from(&self.input_ids)
             .into_shape((1, self.modelinfo.text_input_size))?
             .into_dyn();
@@ -366,7 +373,7 @@ fn search_db(db: Arc<Mutex<Database>>, config: &Config, query: String) -> Result
         for (dist, eid) in scores.iter().take(5) {
             let oid = eid_to_oid.get(eid).expect("eid-to-oid");
             let obj = db.by_id.get(oid).expect("by-id");
-            eprintln!("{dist} {obj:?}")
+            println!("{dist} {obj:?}")
         }
     }
     Ok(())
@@ -418,10 +425,10 @@ async fn handle_search(
             .get(&params.query)
             .cloned();
         if let Some(scores) = hit {
-            eprintln!("(hit) {:?}", &params);
+            log::info!("(hit) {:?}", &params);
             Ok::<_, color_eyre::Report>(scores.clone())
         } else {
-            eprintln!("(miss) {:?}", &params);
+            log::info!("(miss) {:?}", &params);
             let query = params.query.clone();
             let scores: Vec<(f32, usize)> = tokio::task::spawn_blocking(move || -> Result<_> {
                 let embv = if query.starts_with("similar:") {
@@ -465,8 +472,14 @@ async fn handle_search(
                 Ok(scores)
             })
             .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|e| {
+                log::warn!("query failed: {e:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map_err(|e| {
+                log::warn!("bad request: {e:?}");
+                StatusCode::BAD_REQUEST
+            })?;
 
             state
                 .query_cache
@@ -476,7 +489,10 @@ async fn handle_search(
             Ok(scores)
         }
     }
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| {
+        log::warn!("lookup failed: {e:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let db = state.db.lock().unwrap();
     let eid_to_oid: HashMap<_, _> = db
@@ -502,8 +518,14 @@ async fn handle_search(
                 path: url::Url::from_file_path(p).unwrap(),
             })
         })
-        .collect::<Result<Vec<_>>>()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .flat_map(|r: Result<_, color_eyre::Report>| match r {
+            Ok(r) => Some(r),
+            Err(e) => {
+                log::warn!("error resolving eid to obj: {e:?}");
+                None
+            }
+        })
+        .collect::<Vec<_>>();
 
     Ok(axum::Json(NNSearchResponse {
         items: rv,
@@ -542,8 +564,8 @@ fn update_db(
     use_tensorrt: bool,
     readers: usize,
 ) -> Result<()> {
-    eprintln!("Db has {} items.", db.lock().unwrap().by_id.len());
-    eprintln!("Scanning...");
+    log::info!("Db has {} items.", db.lock().unwrap().by_id.len());
+    let pb = indicatif::ProgressBar::new_spinner().with_style(indicatif::ProgressStyle::default_spinner().template("{spinner} Scanning... {pos} files").unwrap());
     let mut scanned = Vec::new();
     let gpu_id = config.gpu_id;
     let minfo = &config.model_info;
@@ -561,6 +583,7 @@ fn update_db(
                 _ => continue,
             };
             scanned.push(loc);
+            pb.inc(1);
         }
     }
     let scanned: Vec<ObjectLocation> = {
@@ -570,8 +593,9 @@ fn update_db(
             .filter(|i| !db.has_embedding(i))
             .collect()
     };
-    eprintln!("Found {} unembedded items.", scanned.len());
-    eprintln!("Processing...");
+    pb.finish();
+    log::info!("Found {} unembedded items.", scanned.len());
+    log::info!("Processing...");
 
     let hasher_tasks = readers;
     let preprocess_tasks: usize = std::thread::available_parallelism()?.get();
@@ -626,12 +650,12 @@ fn update_db(
                                     loc.clone(),
                                     oid,
                                     Object {
-                                        locations: vec![loc],
+                                        locations: vec![loc.clone()],
                                         ..Default::default()
                                     },
                                 );
+                                fpi_s.send((loc, oid, fp)).unwrap();
                             }
-                            fpi_s.send((oid, fp)).unwrap();
                         } else {
                             pbh.inc(1);
 
@@ -646,7 +670,7 @@ fn update_db(
                 let prep_s = prep_s.clone();
                 let pb_rsz = pb_rsz.clone();
                 s.spawn(move |_| {
-                    while let Ok((oid, mut fp)) = fpi_r.recv() {
+                    while let Ok((loc, oid, mut fp)) = fpi_r.recv() {
                         fp.rewind().expect("rewind");
                         if let Ok(img) = image::io::Reader::new(std::io::BufReader::new(fp))
                             .with_guessed_format()
@@ -657,12 +681,12 @@ fn update_db(
                             if let Ok(procd) = preprocess_image(img, config) {
                                 prep_s.send((oid, procd)).unwrap();
                             } else {
-                                log::warn!("Failed to process image for oid: {oid:?}");
+                                log::warn!("Failed to process image for loc: {loc:?}");
                             }
                         } else {
                             pb_rsz.inc(1);
 
-                            log::warn!("Failed to read image for oid: {oid:?}");
+                            log::warn!("Failed to read image for loc: {loc:?}");
                         }
                     }
                 })

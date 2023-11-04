@@ -12,12 +12,11 @@ use serde_hex::{SerHex, Strict};
 
 use ordered_float::NotNan;
 
-use sha2::Digest;
 use std::{
     borrow::Cow,
     cmp::Reverse,
-    collections::HashMap,
-    io::{Seek, Write},
+    collections::{HashMap, HashSet},
+    io::Seek,
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -62,22 +61,6 @@ struct Database {
     clip_embeddings: Vec<Vec<f32>>,
 }
 
-#[derive(Default)]
-struct HasherWriter {
-    pub hasher: sha2::Sha256,
-}
-
-impl Write for HasherWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.update(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn compute_id_file(fh: &mut std::fs::File) -> Result<ObjectId> {
     let mut hw = blake3::Hasher::new();
     hw.update_reader(fh)?;
@@ -114,7 +97,36 @@ impl Database {
         self.by_id.insert(id, obj);
         self.id_by_loc.insert(loc, id);
     }
-    fn persist(&self, config: &Config) -> Result<()> {
+    fn compact_embeddings(&mut self) {
+        let referenced_embeddings: HashSet<_> = self
+            .by_id
+            .values()
+            .flat_map(|obj| obj.embedding_id)
+            .collect();
+        if referenced_embeddings.len() == self.clip_embeddings.len() {
+            // already compact
+            return;
+        }
+        log::info!("Compacting embedding list...");
+        let mut new_embeddings = vec![];
+        let mut remap = HashMap::new();
+        for old_eid in referenced_embeddings.into_iter() {
+            let emb = &self.clip_embeddings[old_eid];
+            let new_eid = new_embeddings.len();
+            new_embeddings.push(emb.to_owned());
+            remap.insert(old_eid, new_eid);
+        }
+        let discarded = self.clip_embeddings.len() - new_embeddings.len();
+        log::info!("Discarded {discarded} unreferenced embeddings.");
+        self.clip_embeddings = new_embeddings;
+        for obj in self.by_id.values_mut() {
+            if let Some(old_eid) = obj.embedding_id {
+                obj.embedding_id = Some(remap[&old_eid]);
+            }
+        }
+    }
+    fn persist(&mut self, config: &Config) -> Result<()> {
+        self.compact_embeddings();
         let encoded = bincode::serialize(self)?;
         if !config.db_path.exists() {
             std::fs::create_dir(&config.db_path)?
@@ -582,9 +594,7 @@ fn update_db(
         for entry in WalkDir::new(root) {
             let path = entry?.path();
             let loc = match path.extension().and_then(|s| s.to_str()) {
-                Some("jpg") | Some("jpeg") | Some("png") => {
-                    ObjectLocation::LocalPath(path)
-                }
+                Some("jpg") | Some("jpeg") | Some("png") => ObjectLocation::LocalPath(path),
                 _ => continue,
             };
             scanned.push(loc);
@@ -701,6 +711,7 @@ fn update_db(
             prep_r
         };
         let mut eps = vec![];
+
         if use_tensorrt {
             eps.push(ort::ExecutionProvider::TensorRT(
                 ort::execution_providers::TensorRTExecutionProviderOptions {

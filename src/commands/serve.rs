@@ -1,16 +1,14 @@
 use crate::{
     mmindex::{
-        database::{Database, ObjectId, ObjectLocation},
+        database::{Database, ObjectLocation},
         embedding::TextEmbedder,
         math::cos_sim,
+        query::EmbeddingExpr,
     },
     Config,
 };
 use axum::http::StatusCode;
-use color_eyre::{
-    eyre::{bail, eyre},
-    Result,
-};
+use color_eyre::{eyre::eyre, Result};
 use ordered_float::NotNan;
 use serde_derive::{Deserialize, Serialize};
 use serde_hex::{SerHex, Strict};
@@ -21,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-type QueryCache = lru::LruCache<String, Vec<(f32, usize)>>;
+type QueryCache = lru::LruCache<EmbeddingExpr, Vec<(f32, usize)>>;
 struct AppState {
     te: Arc<Mutex<TextEmbedder>>,
     db: Arc<Mutex<Database>>,
@@ -30,7 +28,7 @@ struct AppState {
 
 #[derive(Deserialize, Debug)]
 struct SearchParams {
-    query: String,
+    query_json: String,
     limit: Option<usize>,
     skip: Option<usize>,
 }
@@ -58,46 +56,20 @@ async fn handle_search(
     let db = state.db.clone();
     let skip = params.skip.unwrap_or(0);
     let limit = params.limit.unwrap_or(5);
-
+    let query: EmbeddingExpr = serde_json::from_str(&params.query_json).map_err(|e| {
+        log::warn!("query parsing failed: {e:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let scores = {
-        let hit = state
-            .query_cache
-            .lock()
-            .unwrap()
-            .get(&params.query)
-            .cloned();
+        let hit = state.query_cache.lock().unwrap().get(&query).cloned();
         if let Some(scores) = hit {
             log::info!("(hit) {:?}", &params);
             Ok::<_, color_eyre::Report>(scores.clone())
         } else {
             log::info!("(miss) {:?}", &params);
-            let query = params.query.clone();
+            let cquery = query.clone();
             let scores: Vec<(f32, usize)> = tokio::task::spawn_blocking(move || -> Result<_> {
-                let embv = if query.starts_with("similar:") {
-                    let (_, oid) = query.trim().split_once(':').ok_or_else(|| eyre!("split"))?;
-                    if oid.len() < 64 {
-                        bail!("bad oid");
-                    }
-                    let oid: [u8; 32] = SerHex::<serde_hex::Strict>::from_hex(oid)?;
-                    let db = db.lock().unwrap();
-                    let oid = ObjectId { data: oid };
-                    if let Some(obj) = db.by_id.get(&oid) {
-                        if let Some(eid) = obj.embedding_id {
-                            if let Some(emb) = db.clip_embeddings.get(eid) {
-                                emb.clone()
-                            } else {
-                                bail!("no embedding");
-                            }
-                        } else {
-                            bail!("no eid");
-                        }
-                    } else {
-                        bail!("no object");
-                    }
-                } else {
-                    let mut te = te.lock().unwrap();
-                    te.embed_text(&query)?
-                };
+                let embv = crate::mmindex::query::compute_embexpr(db.clone(), te.clone(), &cquery)?;
 
                 let db = db.lock().unwrap();
                 let mut scores: Vec<_> = db
@@ -122,11 +94,7 @@ async fn handle_search(
                 StatusCode::BAD_REQUEST
             })?;
 
-            state
-                .query_cache
-                .lock()
-                .unwrap()
-                .put(params.query.clone(), scores.clone());
+            state.query_cache.lock().unwrap().put(query, scores.clone());
             Ok(scores)
         }
     }

@@ -31,8 +31,7 @@ pub fn search_db(db: Arc<Mutex<Database>>, config: &crate::Config, query: String
             .iter()
             .enumerate()
             .map(|(dbi, dbv)| {
-                let ndbv = normalize(dbv);
-                let dist = cos_sim(&embv, &ndbv);
+                let dist = cos_sim(&embv, dbv);
                 (dist, dbi)
             })
             .collect();

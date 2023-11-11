@@ -214,7 +214,6 @@ pub fn update_db(
                     batch.resize(batch_size, batch[0].clone());
                 }
                 if let Ok(mut embeddings) = embed_images(&mut clip_visual_session, batch) {
-                    //embeddings = embeddings.into_iter().map(|e| normalize(&e)).collect();
                     embeddings.truncate(ids.len()); // in case we padded the batch
                     let mut db = db.lock().unwrap();
                     let sidx = db.clip_embeddings.len();

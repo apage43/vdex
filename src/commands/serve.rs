@@ -84,7 +84,6 @@ async fn handle_search(
                     if let Some(obj) = db.by_id.get(&oid) {
                         if let Some(eid) = obj.embedding_id {
                             if let Some(emb) = db.clip_embeddings.get(eid) {
-                                //normalize(emb)
                                 emb.clone()
                             } else {
                                 bail!("no embedding");

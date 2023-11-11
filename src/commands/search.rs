@@ -4,7 +4,7 @@ use ordered_float::NotNan;
 
 use crate::mmindex::{
     database::Database,
-    math::{cos_sim, normalize},
+    math::cos_sim,
 };
 
 use std::{

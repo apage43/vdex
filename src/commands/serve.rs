@@ -28,7 +28,7 @@ struct AppState {
 
 #[derive(Deserialize, Debug)]
 struct SearchParams {
-    query_json: String,
+    query: String,
     limit: Option<usize>,
     skip: Option<usize>,
 }
@@ -56,7 +56,7 @@ async fn handle_search(
     let db = state.db.clone();
     let skip = params.skip.unwrap_or(0);
     let limit = params.limit.unwrap_or(5);
-    let query: EmbeddingExpr = serde_json::from_str(&params.query_json).map_err(|e| {
+    let query: EmbeddingExpr = crate::mmindex::query::parse_expr(&params.query).map_err(|e| {
         log::warn!("query parsing failed: {e:?}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;

@@ -2,10 +2,7 @@ use color_eyre::Result;
 
 use ordered_float::NotNan;
 
-use crate::mmindex::{
-    database::Database,
-    math::cos_sim,
-};
+use crate::mmindex::{database::Database, math::cos_sim};
 
 use std::{
     cmp::Reverse,

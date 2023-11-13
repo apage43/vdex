@@ -1,0 +1,25 @@
+emb_expr   =  { prefix? ~ primary ~ (infix ~ prefix? ~ primary)* }
+primary    =  _{
+    embed_text
+  | lookup
+  | call
+  | par_expr
+}
+embed_text =  { string }
+par_expr   =  { "(" ~ emb_expr ~ ")" }
+call       =  { ident ~ "(" ~ emb_expr ~ ("," ~ emb_expr)* ~ ")" }
+lookup     =  { "@" ~ string }
+infix      = _{ add | sub }
+add        =  { "+" }
+sub        =  { "-" }
+prefix     = _{ neg }
+neg        =  { "-" }
+ident      =  { (ASCII_ALPHA | "_")+ }
+string     = ${ "\"" ~ inner ~ "\"" }
+inner      = @{ char* }
+char       =  {
+    !("\"" | "\\") ~ ANY
+  | "\\" ~ ("\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t")
+  | "\\" ~ ("u" ~ ASCII_HEX_DIGIT{4})
+}
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }

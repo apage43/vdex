@@ -18,10 +18,10 @@ pub mod commands {
 }
 
 pub mod mmindex {
-    pub mod query;
     pub mod database;
     pub mod embedding;
     pub mod math;
+    pub mod query;
 }
 
 #[derive(Deserialize, Debug)]

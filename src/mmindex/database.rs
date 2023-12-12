@@ -38,13 +38,16 @@ pub fn compute_id_file(fh: &mut std::fs::File) -> Result<ObjectId> {
 }
 
 impl Database {
-    pub fn has_embedding(&self, loc: &ObjectLocation) -> bool {
+    pub fn oid_has_embedding(&self, oid: &ObjectId) -> bool {
+        if let Some(obj) = self.by_id.get(oid) {
+            obj.embedding_id.is_some()
+        } else {
+            false
+        }
+    }
+    pub fn loc_has_embedding(&self, loc: &ObjectLocation) -> bool {
         if let Some(oid) = self.id_by_loc.get(loc) {
-            if let Some(obj) = self.by_id.get(oid) {
-                obj.embedding_id.is_some()
-            } else {
-                false
-            }
+            return self.oid_has_embedding(oid);
         } else {
             false
         }

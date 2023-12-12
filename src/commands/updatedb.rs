@@ -50,7 +50,7 @@ pub fn update_db(
         let db = db.lock().expect("lock");
         scanned
             .into_iter()
-            .filter(|i| !db.has_embedding(i))
+            .filter(|i| !db.loc_has_embedding(i))
             .collect()
     };
     pb.finish();
@@ -107,16 +107,30 @@ pub fn update_db(
                                 pbh.inc(1);
                                 {
                                     let mut db = db.lock().unwrap();
-                                    db.insert(
-                                        loc.clone(),
-                                        oid,
-                                        Object {
-                                            locations: vec![loc.clone()],
-                                            ..Default::default()
-                                        },
-                                    );
+                                    // file w/ this hash has been seen before
+                                    if db.by_id.contains_key(&oid) {
+                                        let obj = db.by_id.get_mut(&oid).unwrap();
+                                        // add the new location to the front
+                                        obj.locations.insert(0, loc.clone());
+                                        // remove any locations that don't exist
+                                        obj.locations
+                                            .retain(|ObjectLocation::LocalPath(p)| p.exists());
+                                        if !db.oid_has_embedding(&oid) {
+                                            // embed only if it hasn't been
+                                            fpi_s.send((loc.clone(), oid, fp)).unwrap();
+                                        }
+                                    } else {
+                                        db.insert(
+                                            loc.clone(),
+                                            oid,
+                                            Object {
+                                                locations: vec![loc.clone()],
+                                                ..Default::default()
+                                            },
+                                        );
+                                        fpi_s.send((loc, oid, fp)).unwrap();
+                                    }
                                 }
-                                fpi_s.send((loc, oid, fp)).unwrap();
                             }
                         } else {
                             pbh.inc(1);

@@ -1,13 +1,17 @@
 use crate::{
     mmindex::{
-        database::{Database, ObjectLocation},
+        database::{Database, Object, ObjectId, ObjectLocation},
         embedding::TextEmbedder,
         math::cos_sim,
         query::EmbeddingExpr,
     },
     Config,
 };
-use axum::http::StatusCode;
+use axum::{
+    http::{request, StatusCode},
+    response::IntoResponse,
+    RequestExt,
+};
 use color_eyre::{eyre::eyre, Result};
 use ordered_float::NotNan;
 use serde_derive::{Deserialize, Serialize};
@@ -19,6 +23,7 @@ use std::{
     num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
+use tower::ServiceExt;
 
 type QueryCache = lru::LruCache<EmbeddingExpr, Vec<(f32, usize)>>;
 struct AppState {
@@ -144,13 +149,63 @@ async fn handle_search(
 }
 async fn handle_serve_image(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> Result<axum::body::Bytes, StatusCode> {
-    todo!()
+    axum::extract::Path(object_id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if let Some(path) = {
+        let db = state.db.lock().unwrap();
+        log::info!("lookup oid: {object_id}");
+        let oid: ObjectId = ObjectId {
+            data: SerHex::<Strict>::from_hex(object_id).map_err(|_| StatusCode::NOT_ACCEPTABLE)?,
+        };
+        let obj = if let Some(obj) = db.by_id.get(&oid) {
+            obj
+        } else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        log::info!("Got obj: {obj:?}");
+        obj.locations
+            .iter()
+            .find_map(|loc| {
+                let ObjectLocation::LocalPath(p) = loc;
+                if p.exists() {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .cloned()
+    } {
+        log::info!("found, local path: {path:?}");
+        let tfile = tokio::fs::File::open(path)
+            .await
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        let stream = tokio_util::io::ReaderStream::new(tfile);
+        Ok(axum::body::Body::from_stream(stream))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+#[derive(Serialize, Debug)]
+pub struct ObjectMetadata {
+    #[serde(with = "SerHex::<Strict>")]
+    oid: [u8; 32],
 }
 async fn handle_export_metadata(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> Result<axum::Json<()>, StatusCode> {
-    todo!()
+) -> Result<axum::Json<Vec<ObjectMetadata>>, StatusCode> {
+    let db = state.db.lock().unwrap();
+    let by_eid: HashMap<usize, ObjectId> = db
+        .by_id
+        .iter()
+        .filter_map(|(oid, obj)| Some((obj.embedding_id?, *oid)))
+        .collect();
+    Ok(axum::Json(
+        (0..db.clip_embeddings.len())
+            .map(|eid| ObjectMetadata {
+                oid: by_eid.get(&eid).unwrap().data,
+            })
+            .collect(),
+    ))
 }
 async fn handle_export_embeddings(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -185,9 +240,11 @@ async fn handle_export_embeddings(
 async fn serve(app: axum::Router, port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     log::info!("Listening on {addr:?}");
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await?;
+    axum::serve(
+        tokio::net::TcpListener::bind(addr).await?,
+        app.into_make_service(),
+    )
+    .await?;
     Ok(())
 }
 pub fn serve_search(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {

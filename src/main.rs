@@ -78,6 +78,7 @@ fn main() -> color_eyre::Result<()> {
             Ok(fbsrc) => bincode::deserialize(&fbsrc)?,
             _ => Database::default(),
         };
+        log::info!("DB has {} items, {} embeddings", db.by_id.len(), db.clip_embeddings.len());
         let db = Arc::new(Mutex::new(db));
         Ok::<_, color_eyre::Report>(db)
     };

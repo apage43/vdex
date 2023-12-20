@@ -15,6 +15,7 @@ use serde_hex::{SerHex, Strict};
 use std::{
     cmp::Reverse,
     collections::HashMap,
+    io::Write,
     num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
@@ -141,8 +142,49 @@ async fn handle_search(
         more: skip + limit < db.by_id.len(),
     }))
 }
+async fn handle_serve_image(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<axum::body::Bytes, StatusCode> {
+    todo!()
+}
+async fn handle_export_metadata(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<axum::Json<()>, StatusCode> {
+    todo!()
+}
+async fn handle_export_embeddings(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<axum::body::Bytes, StatusCode> {
+    let db = state.db.lock().unwrap();
+    if db.clip_embeddings.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let emb_dim = db.clip_embeddings.first().unwrap().len();
+    let emb_count = db.clip_embeddings.len();
+    let hdr_meta_pfx = r#"{'descr':'<f4','fortran_order':False,'shape':"#;
+    let hdr_meta = format!("{hdr_meta_pfx}({emb_count},{emb_dim}){}", r"}");
+    let hdr_len = 6 + 2 + 2; // 6 byte magic + 2 bytes for version + u16 len
+    let padded_len = (hdr_meta.len() + hdr_len).div_ceil(64) * 64;
+    let mut response: Vec<u8> = vec![0x93];
+    response.extend_from_slice(b"NUMPY");
+    response.push(1); // v1.0
+    response.push(0);
+    response
+        .write_all(&((padded_len - hdr_len) as u16).to_le_bytes())
+        .unwrap();
+    response.write_all(hdr_meta.as_bytes()).unwrap();
+    response.resize((padded_len - 1) as usize, b' ');
+    response.push(b'\n');
+    for emb in db.clip_embeddings.iter() {
+        for el in emb {
+            response.write_all(&el.to_le_bytes()).unwrap();
+        }
+    }
+    Ok(response.into())
+}
 async fn serve(app: axum::Router, port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    log::info!("Listening on {addr:?}");
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await?;
@@ -159,6 +201,15 @@ pub fn serve_search(db: Arc<Mutex<Database>>, config: &Config) -> Result<()> {
     });
     let app = axum::Router::new()
         .route("/search_text", axum::routing::get(handle_search))
+        .route(
+            "/export_embeddings_npy",
+            axum::routing::get(handle_export_embeddings),
+        )
+        .route(
+            "/export_metadata",
+            axum::routing::get(handle_export_metadata),
+        )
+        .route("/image_by_oid/:oid", axum::routing::get(handle_serve_image))
         .with_state(state);
 
     rt.block_on(async move { serve(app, 6680).await })?;

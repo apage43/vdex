@@ -1,7 +1,9 @@
 /target
+__pycache__
 config*.toml
 .lsp/
 .vscode/
 engine_cache/
 *.onnx
 db.bc*
+/env

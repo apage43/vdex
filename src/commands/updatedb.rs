@@ -116,6 +116,7 @@ pub fn update_db(
                                         obj.locations
                                             .retain(|ObjectLocation::LocalPath(p)| p.exists());
                                         if !db.oid_has_embedding(&oid) {
+                                            drop(db);
                                             // embed only if it hasn't been
                                             fpi_s.send((loc.clone(), oid, fp)).unwrap();
                                         }
@@ -128,6 +129,7 @@ pub fn update_db(
                                                 ..Default::default()
                                             },
                                         );
+                                        drop(db);
                                         fpi_s.send((loc, oid, fp)).unwrap();
                                     }
                                 }

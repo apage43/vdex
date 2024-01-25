@@ -8,9 +8,8 @@ use crate::{
     Config,
 };
 use axum::{
-    http::{request, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
-    RequestExt,
 };
 use color_eyre::{eyre::eyre, Result};
 use ordered_float::NotNan;

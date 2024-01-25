@@ -24,7 +24,7 @@ ort = { version = "1.16.3", features = [
 ] }
 ndarray = "0.15.6"
 ndarray-ndimage = "0.4.0"
-tracing-subscriber = "0.3.17"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 tracing = "0.1.37"
 clap = { version = "4.4.3", features = ["derive"] }
 tokenizers = { version = "0.14.0", features = ["hf-hub", "http"] }
